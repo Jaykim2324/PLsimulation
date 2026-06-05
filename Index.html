@@ -1,0 +1,1278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>HUMAX UK — Revenue & Scenario Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<style>html,body{margin:0;padding:0;background:#f5f7fa;}</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useMemo } = React;
+
+// ============================================================
+//  HUK 3-Year P&L Simulator
+//  EV (category-level) + STB (FHR-6000T) + BT maintenance
+//  Adjustable revenue scenarios & cost-reduction levers
+// ============================================================
+
+// ---- Central configuration (editable in Settings; referenced by all pages) ----
+// Mutable in-memory store. Settings page updates these; pages re-read on each render.
+const CONFIG = {
+  price: {
+    ev_socket: 332.14,
+    ev_5m: 342.37,
+    ev_75m: 357.73,
+    ev_22kw: 579.0,
+    stb_fhr: 153.0,
+  },
+  // EV home blended mix weights (must sum to 1)
+  mix: { socket: 0.5, c5m: 0.25, c75m: 0.25 },
+  gm: { ev: 0.2, stb: 0.2, bt: 1.0 }, // gross margins
+  fx: 1810.195, // KRW per GBP
+};
+// Back-compat references used throughout the app:
+const PRICE = CONFIG.price;          // object ref — mutating properties is reflected everywhere
+const GM = CONFIG.gm;                // object ref
+const getFX = () => CONFIG.fx;       // FX can change, so read via function
+const evBlended = () =>
+  CONFIG.mix.socket * PRICE.ev_socket + CONFIG.mix.c5m * PRICE.ev_5m + CONFIG.mix.c75m * PRICE.ev_75m;
+const prodPrice = (key) => (key === "MX22" ? PRICE.ev_22kw : evBlended());
+
+// ---- EV categories: 2026 BP annual target (from Monthly Tracking) ----
+// baseUnits = 2026 plan; we scale per scenario & per year
+const EV_CATEGORIES = [
+  { key: "wholesaler", label: "Wholesaler", base: 4220, note: "Yesss·CEF wholesale channel" },
+  { key: "distributor", label: "Distributor", base: 600, note: "Stearn and mid-tier distribution" },
+  { key: "ecommerce", label: "eCommerce", base: 272, note: "Argos·Online" },
+  { key: "dealer", label: "Dealer", base: 1400, note: "BYD and dealerships" },
+  { key: "fleet", label: "Fleet", base: 1500, note: "B2B Home/Commercial Fleet" },
+  { key: "cpo", label: "CPO", base: 805, note: "Commercial B2B / CPO" },
+];
+
+// scenario multipliers vs BP target (Worst/Base/Best), per year
+// 2026 anchored to realistic run-rate (Worst ≈ current pace), grows in 27/28
+const SCENARIO_MULT = {
+  worst: { 2026: 0.08, 2027: 0.16, 2028: 0.24 },
+  base: { 2026: 0.14, 2027: 0.25, 2028: 0.40 },
+  best: { 2026: 0.24, 2027: 0.40, 2028: 0.62 },
+};
+
+// STB FHR-6000T units by scenario (2026 BP = 20,280). Declines after.
+const STB_UNITS = {
+  worst: { 2026: 14196, 2027: 9000, 2028: 4500 },
+  base: { 2026: 17238, 2027: 12000, 2028: 7000 },
+  best: { 2026: 20280, 2027: 16000, 2028: 11000 },
+};
+
+// BT maintenance: £700k through 2027, removed 2028
+const BT_REV = { 2026: 700000, 2027: 700000, 2028: 0 };
+
+// Base fixed-cost budget (Jeff PL) & 2026 actual budget
+const BASE_FIXED = 2154193;
+
+const YEARS = [2026, 2027, 2028];
+const SCEN = [
+  { key: "worst", label: "Worst", color: "#d64545" },
+  { key: "base", label: "Base", color: "#00B1A1" },
+  { key: "best", label: "Best", color: "#163E35" },
+];
+
+const fmtGBP = (n) =>
+  (n < 0 ? "−£" : "£") + Math.abs(Math.round(n)).toLocaleString();
+const fmtM = (n) => (n < 0 ? "−£" : "£") + (Math.abs(n) / 1e6).toFixed(2) + "M";
+const fmtKRW = (n) =>
+  (n < 0 ? "−₩" : "₩") + Math.abs(Math.round(n * getFX())).toLocaleString();
+const r0k = (n) => Math.round(n).toLocaleString();
+
+function Simulator() {
+  const [scenario, setScenario] = useState("base");
+  const [year, setYear] = useState(2026);
+
+  // EV category multiplier overrides (per category, % of BP target)
+  const [catMult, setCatMult] = useState(() =>
+    Object.fromEntries(EV_CATEGORIES.map((c) => [c.key, 100]))
+  );
+  // STB unit override (% of scenario default)
+  const [stbAdj, setStbAdj] = useState(100);
+  // Cost reduction lever (£ saved off fixed cost), applied from 2027
+  const [savings, setSavings] = useState({ 2026: 0, 2027: 687000, 2028: 687000 });
+  const [btKeep2028, setBtKeep2028] = useState(false);
+
+  const setCat = (k, v) => setCatMult((p) => ({ ...p, [k]: v }));
+
+  // ---- compute one year/scenario ----
+  const compute = (sc, yr, useOverrides) => {
+    const mult = SCENARIO_MULT[sc][yr];
+    // EV revenue by category
+    let evUnits = 0;
+    const catBreak = EV_CATEGORIES.map((c) => {
+      const ov = useOverrides ? catMult[c.key] / 100 : 1;
+      const u = c.base * mult * ov;
+      evUnits += u;
+      return { ...c, units: u, rev: u * evBlended() };
+    });
+    const evRev = evUnits * evBlended();
+    // STB
+    const stbBase = STB_UNITS[sc][yr];
+    const stbU = stbBase * (useOverrides ? stbAdj / 100 : 1);
+    const stbRev = stbU * PRICE.stb_fhr;
+    // BT
+    let btRev = BT_REV[yr];
+    if (yr === 2028 && btKeep2028) btRev = 700000;
+    // GP
+    const gp = evRev * GM.ev + stbRev * GM.stb + btRev * GM.bt;
+    const totRev = evRev + stbRev + btRev;
+    const fixed = BASE_FIXED - (useOverrides ? savings[yr] : 0);
+    const net = gp - fixed;
+    return { evUnits, evRev, catBreak, stbU, stbRev, btRev, gp, totRev, fixed, net };
+  };
+
+  const cur = useMemo(() => compute(scenario, year, true), [scenario, year, catMult, stbAdj, savings, btKeep2028]);
+
+  // 3-year x 3-scenario grid (with overrides applied to chosen scenario only? -> apply globally for comparison)
+  const grid = useMemo(() => {
+    const g = {};
+    SCEN.forEach((s) => {
+      g[s.key] = YEARS.map((y) => compute(s.key, y, s.key === scenario));
+    });
+    return g;
+  }, [scenario, catMult, stbAdj, savings, btKeep2028]);
+
+  const maxAbs = Math.max(
+    ...SCEN.flatMap((s) => grid[s.key].map((d) => Math.abs(d.net))),
+    1
+  );
+
+  // ---- Excel export with current setup ----
+  const exportExcel = () => {
+    const wb = XLSX.utils.book_new();
+    const r0 = (n) => Math.round(n);
+
+    // Sheet 1: Summary (3yr x 3scenario Net P/L)
+    const sumRows = [
+      ["HUK 3-Year P&L Simulation — Export"],
+      [`Setup note: slider adjustments applied to the '${SCEN.find((s) => s.key === scenario).label}' scenario`],
+      [],
+      ["Net P/L (GBP)", ...YEARS],
+      ...SCEN.map((s) => [s.label, ...grid[s.key].map((d) => r0(d.net))]),
+      [],
+      ["Net P/L (KRW)", ...YEARS],
+      ...SCEN.map((s) => [s.label, ...grid[s.key].map((d) => r0(d.net * getFX()))]),
+      [],
+      ["Total Revenue (GBP)", ...YEARS],
+      ...SCEN.map((s) => [s.label, ...grid[s.key].map((d) => r0(d.totRev))]),
+      [],
+      ["Gross Profit (GBP)", ...YEARS],
+      ...SCEN.map((s) => [s.label, ...grid[s.key].map((d) => r0(d.gp))]),
+      [],
+      ["Fixed Cost (GBP)", ...YEARS],
+      ...SCEN.map((s) => [s.label, ...grid[s.key].map((d) => r0(d.fixed))]),
+    ];
+    const ws1 = XLSX.utils.aoa_to_sheet(sumRows);
+    ws1["!cols"] = [{ wch: 22 }, { wch: 14 }, { wch: 14 }, { wch: 14 }];
+    XLSX.utils.book_append_sheet(wb, ws1, "Summary");
+
+    // Sheet 2-4: per-scenario detailed breakdown (revenue lines + EV categories)
+    SCEN.forEach((s) => {
+      const data = YEARS.map((y) => compute(s.key, y, s.key === scenario));
+      const rows = [
+        [`${s.label} Scenario — 3-Year Detail`],
+        [],
+        ["Revenue (GBP)", ...YEARS],
+        ["BT Operator", ...data.map((d) => r0(d.btRev))],
+        ["STB (FHR-6000T)", ...data.map((d) => r0(d.stbRev))],
+        ["EV Sales", ...data.map((d) => r0(d.evRev))],
+        ["Total Revenue", ...data.map((d) => r0(d.totRev))],
+        [],
+        ["Gross Profit (GBP)", ...YEARS],
+        ["BT (100%)", ...data.map((d) => r0(d.btRev * GM.bt))],
+        ["STB (20%)", ...data.map((d) => r0(d.stbRev * GM.stb))],
+        ["EV (20%)", ...data.map((d) => r0(d.evRev * GM.ev))],
+        ["Total GP", ...data.map((d) => r0(d.gp))],
+        [],
+        ["Fixed Cost", ...data.map((d) => r0(d.fixed))],
+        ["NET P/L (GBP)", ...data.map((d) => r0(d.net))],
+        ["NET P/L (KRW)", ...data.map((d) => r0(d.net * getFX()))],
+        [],
+        ["Units", ...YEARS],
+        ["STB units", ...data.map((d) => r0(d.stbU))],
+        ["EV units (total)", ...data.map((d) => r0(d.evUnits))],
+        [],
+        ["EV units by category", ...YEARS],
+        ...EV_CATEGORIES.map((c, i) => [
+          c.label,
+          ...data.map((d) => r0(d.catBreak[i].units)),
+        ]),
+        [],
+        ["EV revenue by category (GBP)", ...YEARS],
+        ...EV_CATEGORIES.map((c, i) => [
+          c.label,
+          ...data.map((d) => r0(d.catBreak[i].rev)),
+        ]),
+      ];
+      const ws = XLSX.utils.aoa_to_sheet(rows);
+      ws["!cols"] = [{ wch: 26 }, { wch: 14 }, { wch: 14 }, { wch: 14 }];
+      XLSX.utils.book_append_sheet(wb, ws, s.label);
+    });
+
+    // Sheet 5: Assumptions
+    const aRows = [
+      ["Assumptions & Settings"],
+      [],
+      ["Pricing (GBP)", ""],
+      ["EV Socket", PRICE.ev_socket],
+      ["EV 5M", PRICE.ev_5m],
+      ["EV 7.5M", PRICE.ev_75m],
+      ["EV 22kW (MX Pro)", PRICE.ev_22kw],
+      ["EV blended (50/25/25)", +evBlended().toFixed(2)],
+      ["STB FHR-6000T", PRICE.stb_fhr],
+      [],
+      ["Gross Margin", ""],
+      ["EV / STB / BT", `${GM.ev * 100}% / ${GM.stb * 100}% / ${GM.bt * 100}%`],
+      ["FX (KRW/GBP)", getFX()],
+      ["Base Fixed Cost", BASE_FIXED],
+      [],
+      ["Cost reduction applied (GBP)", ""],
+      ...YEARS.map((y) => [`${y} savings`, savings[y]]),
+      [],
+      ["Current EV category overrides (% of BP target)", ""],
+      ...EV_CATEGORIES.map((c) => [c.label, catMult[c.key] + "%"]),
+      ["STB adjustment", stbAdj + "%"],
+      ["BT kept in 2028", btKeep2028 ? "Yes" : "No"],
+      [],
+      ["EV category BP target (2026, units)", ""],
+      ...EV_CATEGORIES.map((c) => [c.label, c.base]),
+    ];
+    const ws5 = XLSX.utils.aoa_to_sheet(aRows);
+    ws5["!cols"] = [{ wch: 38 }, { wch: 16 }];
+    XLSX.utils.book_append_sheet(wb, ws5, "Assumptions");
+
+    XLSX.writeFile(wb, "HUK_3Year_PL_Simulation.xlsx");
+  };
+
+  return (
+    <>
+      <header style={S.header}>
+        <div>
+          <div style={S.kicker}>HUMAX UK · FINANCIAL SCENARIO LAB</div>
+          <h1 style={S.h1}>3-Year P&L Simulator</h1>
+          <div style={S.sub}>
+            EV (category-level) · STB FHR-6000T · BT maintenance — adjust revenue & cost-reduction scenarios
+          </div>
+        </div>
+        <div style={S.headerRight}>
+          <button onClick={exportExcel} style={S.dlBtn}>
+            <span style={{ fontSize: 15 }}>↓</span> Download Excel
+          </button>
+          <div style={S.netBadge}>
+            <div style={S.netBadgeLabel}>{year} · {SCEN.find((s) => s.key === scenario).label} · Net P/L</div>
+            <div style={{ ...S.netBadgeVal, color: cur.net >= 0 ? "#00B1A1" : "#d64545" }}>
+              {fmtGBP(cur.net)}
+            </div>
+            <div style={S.netBadgeKrw}>{fmtKRW(cur.net)}</div>
+          </div>
+        </div>
+      </header>
+
+      {/* selectors */}
+      <div style={S.selectorRow}>
+        <div style={S.segGroup}>
+          {SCEN.map((s) => (
+            <button
+              key={s.key}
+              onClick={() => setScenario(s.key)}
+              style={{
+                ...S.seg,
+                ...(scenario === s.key ? { background: s.color, color: "#fff", borderColor: s.color } : {}),
+              }}
+            >
+              {s.label}
+            </button>
+          ))}
+        </div>
+        <div style={S.segGroup}>
+          {YEARS.map((y) => (
+            <button
+              key={y}
+              onClick={() => setYear(y)}
+              style={{ ...S.seg, ...(year === y ? S.segActiveDark : {}) }}
+            >
+              {y}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div style={S.grid2}>
+        {/* LEFT: revenue controls */}
+        <section style={S.panel}>
+          <h2 style={S.h2}>Revenue Scenario Controls</h2>
+          <div style={S.panelNote}>
+            Based on <b>{SCEN.find((s) => s.key === scenario).label} · {year}</b>. Sliders adjust achievement (%) vs BP target.
+          </div>
+
+          <div style={S.blockLabel}>EV — by Category (blended £{evBlended().toFixed(0)}/unit)</div>
+          {cur.catBreak.map((c) => (
+            <div key={c.key} style={S.sliderRow}>
+              <div style={S.sliderHead}>
+                <span style={S.sliderName}>{c.label}</span>
+                <span style={S.sliderVal}>
+                  {Math.round(c.units).toLocaleString()} units · {fmtGBP(c.rev)}
+                </span>
+              </div>
+              <input
+                type="range" min="0" max="200" value={catMult[c.key]}
+                onChange={(e) => setCat(c.key, +e.target.value)}
+                style={S.range}
+              />
+              <div style={S.sliderSub}>{c.note} · {catMult[c.key]}%</div>
+            </div>
+          ))}
+          <div style={S.catTotal}>
+            <span style={S.catTotalLabel}>EV Total</span>
+            <span style={S.catTotalVal}>
+              {Math.round(cur.evUnits).toLocaleString()} units · {fmtGBP(cur.evRev)}
+              <span style={S.catTotalGp}> (GP {fmtGBP(cur.evRev * GM.ev)})</span>
+            </span>
+          </div>
+
+          <div style={{ ...S.blockLabel, marginTop: 18 }}>STB — FHR-6000T (£{PRICE.stb_fhr}/unit)</div>
+          <div style={S.sliderRow}>
+            <div style={S.sliderHead}>
+              <span style={S.sliderName}>FHR-6000T</span>
+              <span style={S.sliderVal}>{Math.round(cur.stbU).toLocaleString()} units · {fmtGBP(cur.stbRev)}</span>
+            </div>
+            <input type="range" min="0" max="150" value={stbAdj}
+              onChange={(e) => setStbAdj(+e.target.value)} style={S.range} />
+            <div style={S.sliderSub}>{stbAdj}% of scenario default</div>
+          </div>
+
+          <div style={{ ...S.blockLabel, marginTop: 18 }}>BT Maintenance</div>
+          <div style={S.btRow}>
+            <span style={S.sliderName}>{cur.btRev > 0 ? fmtGBP(cur.btRev) : "Removed (£0)"}</span>
+            {year === 2028 && (
+              <label style={S.checkLabel}>
+                <input type="checkbox" checked={btKeep2028}
+                  onChange={(e) => setBtKeep2028(e.target.checked)} />
+                Keep BT in 2028
+              </label>
+            )}
+            {year !== 2028 && <span style={S.sliderSub}>£700k through 2027 · removed in 2028</span>}
+          </div>
+        </section>
+
+        {/* RIGHT: cost + result */}
+        <section style={S.panel}>
+          <h2 style={S.h2}>Cost Reduction & P&L</h2>
+          <div style={S.blockLabel}>Fixed-Cost Savings (by year, £)</div>
+          {YEARS.map((y) => (
+            <div key={y} style={S.sliderRow}>
+              <div style={S.sliderHead}>
+                <span style={S.sliderName}>{y} savings</span>
+                <span style={S.sliderVal}>{fmtGBP(savings[y])}</span>
+              </div>
+              <input type="range" min="0" max="1000000" step="1000" value={savings[y]}
+                onChange={(e) => setSavings((p) => ({ ...p, [y]: +e.target.value }))}
+                style={S.range} />
+              <div style={S.sliderSub}>
+                Adjusted fixed cost {fmtGBP(BASE_FIXED - savings[y])} · {((savings[y] / BASE_FIXED) * 100).toFixed(1)}% reduction
+              </div>
+            </div>
+          ))}
+
+          {/* P&L waterfall for current selection */}
+          <div style={S.plBox}>
+            <div style={S.plTitle}>{year} · {SCEN.find((s) => s.key === scenario).label} P&L</div>
+            {[
+              ["BT Operator", cur.btRev, cur.btRev * GM.bt],
+              ["STB (FHR-6000T)", cur.stbRev, cur.stbRev * GM.stb],
+              ["EV Sales", cur.evRev, cur.evRev * GM.ev],
+            ].map(([l, rev, gp]) => (
+              <div key={l} style={S.plRow}>
+                <span>{l}</span>
+                <span style={S.plRev}>{fmtM(rev)}</span>
+                <span style={S.plGp}>GP {fmtM(gp)}</span>
+              </div>
+            ))}
+            <div style={{ ...S.plRow, ...S.plSub }}>
+              <span>Total Revenue</span>
+              <span style={S.plRev}>{fmtM(cur.totRev)}</span>
+              <span style={S.plGp}>GP {fmtM(cur.gp)}</span>
+            </div>
+            <div style={{ ...S.plRow, color: "#777" }}>
+              <span>Fixed Cost</span>
+              <span></span>
+              <span style={S.plGp}>−{fmtM(cur.fixed)}</span>
+            </div>
+            <div style={{ ...S.plRow, ...S.plNet, color: cur.net >= 0 ? "#00B1A1" : "#d64545" }}>
+              <span>Net P/L</span>
+              <span></span>
+              <span style={S.plGp}>{fmtGBP(cur.net)}</span>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      {/* 3yr x 3scenario matrix */}
+      <section style={S.panel}>
+        <h2 style={S.h2}>3-Year × Scenario — Net P/L · Units · Revenue · Margin</h2>
+        <div style={S.matrix}>
+          <div style={S.matrixHead}></div>
+          {YEARS.map((y) => <div key={y} style={S.matrixHead}>{y}</div>)}
+          {SCEN.map((s) => (
+            <React.Fragment key={s.key}>
+              <div style={{ ...S.matrixRowLabel, color: s.color }}>{s.label}</div>
+              {grid[s.key].map((d, i) => (
+                <div key={i} style={S.matrixCell}>
+                  <div style={S.barWrap}>
+                    <div style={{
+                      ...S.bar,
+                      width: `${(Math.abs(d.net) / maxAbs) * 100}%`,
+                      background: d.net >= 0 ? "#00B1A1" : "#d64545",
+                      marginLeft: d.net >= 0 ? "50%" : `${50 - (Math.abs(d.net) / maxAbs) * 50}%`,
+                    }} />
+                    <div style={S.barAxis} />
+                  </div>
+                  <div style={{ ...S.matrixVal, color: d.net >= 0 ? "#00B1A1" : "#d64545" }}>
+                    {fmtGBP(d.net)}
+                  </div>
+                  <div style={S.matrixMeta}>
+                    <div style={S.metaLine}><span>Units</span><span>{r0k(d.evUnits + d.stbU)}</span></div>
+                    <div style={S.metaLine}><span>Revenue</span><span>{fmtM(d.totRev)}</span></div>
+                    <div style={S.metaLine}><span>Margin</span><span>{fmtM(d.gp)}</span></div>
+                  </div>
+                </div>
+              ))}
+            </React.Fragment>
+          ))}
+        </div>
+        <div style={S.footNote}>
+          Note: slider adjustments apply only to the selected <b>{SCEN.find((s) => s.key === scenario).label}</b> scenario.
+          The other two scenarios use default assumptions. Cost reduction applies equally to all three.
+          EV blended £{evBlended().toFixed(0)} · STB £{PRICE.stb_fhr} · BT £700k through 2027 · FX {getFX()} KRW/£.
+        </div>
+      </section>
+    </>
+  );
+}
+
+// ============================================================
+//  HUMAX EV Charging — Design System
+//  Indigo #001C3D · Azure #00B1A1 · Sunshine #FDB515 · Forest #163E35
+//  Typeface: Poppins
+// ============================================================
+const HX = {
+  indigo: "#001C3D",
+  azure: "#00B1A1",
+  sunshine: "#00B1A1",
+  forest: "#163E35",
+  ink: "#0d1b2a",
+  paper: "#f5f7fa",
+  card: "#ffffff",
+  line: "#dde3ea",
+  muted: "#5b6b7d",
+};
+const ACCENT = HX.indigo;
+const POS = HX.azure;   // profit
+const NEG = "#d64545";  // loss
+
+const CSS = `
+  @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700;800&display=swap');
+  * { box-sizing: border-box; }
+  input[type=range]{ -webkit-appearance:none; appearance:none; height:5px; border-radius:5px; background:#d4dce5; outline:none; }
+  input[type=range]::-webkit-slider-thumb{ -webkit-appearance:none; width:18px; height:18px; border-radius:50%; background:${HX.azure}; cursor:pointer; border:3px solid ${HX.indigo}; box-shadow:0 1px 5px rgba(0,28,61,.3); }
+  input[type=range]::-moz-range-thumb{ width:18px; height:18px; border-radius:50%; background:${HX.azure}; cursor:pointer; border:3px solid ${HX.indigo}; }
+`;
+
+const S = {
+  page: { fontFamily: "'Poppins', sans-serif", background: HX.paper, minHeight: "100vh", padding: "28px 32px 60px", color: HX.ink },
+  header: { display: "flex", justifyContent: "space-between", alignItems: "flex-end", flexWrap: "wrap", gap: 20, background: HX.indigo, borderRadius: 16, padding: "26px 30px", marginBottom: 22, boxShadow: "0 8px 28px rgba(0,28,61,.18)" },
+  kicker: { fontFamily: "'Poppins', sans-serif", fontSize: 11, letterSpacing: 3, color: HX.sunshine, fontWeight: 600, textTransform: "uppercase" },
+  h1: { fontFamily: "'Poppins', sans-serif", fontSize: 34, fontWeight: 700, margin: "6px 0 6px", lineHeight: 1.05, color: "#fff", letterSpacing: -0.5 },
+  sub: { fontSize: 13, color: "#aebccd", fontWeight: 300 },
+  headerRight: { display: "flex", alignItems: "stretch", gap: 12 },
+  dlBtn: { fontFamily: "'Poppins', sans-serif", fontSize: 13, fontWeight: 600, padding: "0 20px", border: `2px solid ${HX.sunshine}`, borderRadius: 12, background: HX.sunshine, color: HX.indigo, cursor: "pointer", display: "flex", alignItems: "center", gap: 8, whiteSpace: "nowrap" },
+  netBadge: { textAlign: "right", background: "rgba(255,255,255,.08)", border: "1px solid rgba(255,255,255,.18)", borderRadius: 12, padding: "12px 20px", backdropFilter: "blur(4px)" },
+  netBadgeLabel: { fontSize: 10.5, color: "#aebccd", fontWeight: 400, letterSpacing: 0.5, textTransform: "uppercase" },
+  netBadgeVal: { fontFamily: "'Poppins', sans-serif", fontSize: 28, fontWeight: 700, lineHeight: 1.15 },
+  netBadgeKrw: { fontSize: 11.5, color: "#8da0b5", fontWeight: 300 },
+  selectorRow: { display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 20 },
+  segGroup: { display: "flex", gap: 4, background: "#fff", padding: 4, borderRadius: 12, border: `1px solid ${HX.line}`, boxShadow: "0 1px 6px rgba(0,28,61,.05)" },
+  seg: { fontFamily: "'Poppins', sans-serif", fontSize: 13, fontWeight: 500, padding: "7px 18px", border: "1px solid transparent", borderRadius: 8, background: "transparent", cursor: "pointer", color: HX.muted },
+  segActiveDark: { background: HX.indigo, color: "#fff", borderColor: HX.indigo },
+  grid2: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20, marginBottom: 20 },
+  panel: { background: HX.card, border: `1px solid ${HX.line}`, borderRadius: 16, padding: "22px 24px", boxShadow: "0 4px 18px rgba(0,28,61,.05)" },
+  h2: { fontFamily: "'Poppins', sans-serif", fontSize: 19, fontWeight: 600, margin: "0 0 6px", color: HX.indigo },
+  panelNote: { fontSize: 12.5, color: HX.muted, marginBottom: 16, fontWeight: 300 },
+  blockLabel: { fontFamily: "'Poppins', sans-serif", fontSize: 11, letterSpacing: 1.5, color: HX.azure, fontWeight: 600, textTransform: "uppercase", marginBottom: 12, borderBottom: `2px solid #eef2f6`, paddingBottom: 6 },
+  sliderRow: { marginBottom: 14 },
+  sliderHead: { display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 5 },
+  sliderName: { fontSize: 13.5, fontWeight: 600, color: HX.ink },
+  sliderVal: { fontFamily: "'Poppins', sans-serif", fontSize: 12.5, color: HX.indigo, fontWeight: 600 },
+  range: { width: "100%" },
+  sliderSub: { fontSize: 11, color: "#8a98a8", marginTop: 3, fontWeight: 300 },
+  catTotal: { display: "flex", justifyContent: "space-between", alignItems: "baseline", marginTop: 12, padding: "12px 16px", background: `linear-gradient(135deg, ${HX.indigo}, ${HX.forest})`, borderRadius: 12, color: "#fff" },
+  catTotalLabel: { fontFamily: "'Poppins', sans-serif", fontSize: 12, letterSpacing: 1.5, fontWeight: 600, color: HX.sunshine, textTransform: "uppercase" },
+  catTotalVal: { fontFamily: "'Poppins', sans-serif", fontSize: 14.5, fontWeight: 700 },
+  catTotalGp: { fontWeight: 300, opacity: 0.85, fontSize: 12.5 },
+  btRow: { display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" },
+  checkLabel: { fontSize: 12.5, display: "flex", alignItems: "center", gap: 6, cursor: "pointer", color: HX.ink, fontWeight: 500 },
+  plBox: { marginTop: 18, background: "#f7fafb", border: `1px solid ${HX.line}`, borderRadius: 12, padding: "16px 18px" },
+  plTitle: { fontFamily: "'Poppins', sans-serif", fontSize: 11, letterSpacing: 1.5, color: HX.azure, fontWeight: 600, marginBottom: 10, textTransform: "uppercase" },
+  plRow: { display: "grid", gridTemplateColumns: "1.4fr 1fr 1fr", fontSize: 13, padding: "5px 0", alignItems: "center" },
+  plRev: { textAlign: "right", fontFamily: "'Poppins', sans-serif", color: HX.muted, fontWeight: 400 },
+  plGp: { textAlign: "right", fontFamily: "'Poppins', sans-serif", fontWeight: 600 },
+  plSub: { borderTop: `1px solid ${HX.line}`, marginTop: 4, paddingTop: 8, fontWeight: 600 },
+  plNet: { borderTop: `2px solid ${HX.indigo}`, marginTop: 4, paddingTop: 8, fontFamily: "'Poppins', sans-serif", fontSize: 16, fontWeight: 700 },
+  matrix: { display: "grid", gridTemplateColumns: "80px 1fr 1fr 1fr", gap: 10, alignItems: "stretch" },
+  matrixHead: { fontFamily: "'Poppins', sans-serif", fontSize: 12, color: HX.muted, textAlign: "center", fontWeight: 600, alignSelf: "center" },
+  matrixRowLabel: { fontFamily: "'Poppins', sans-serif", fontSize: 15, fontWeight: 700, alignSelf: "center" },
+  matrixCell: { background: "#f7fafb", border: `1px solid ${HX.line}`, borderRadius: 10, padding: "10px 12px" },
+  barWrap: { position: "relative", height: 14, marginBottom: 6 },
+  bar: { position: "absolute", top: 3, height: 8, borderRadius: 4, minWidth: 2 },
+  barAxis: { position: "absolute", left: "50%", top: 0, bottom: 0, width: 1, background: "#c4d0dc" },
+  matrixVal: { fontFamily: "'Poppins', sans-serif", fontSize: 13.5, fontWeight: 700, textAlign: "center" },
+  matrixMeta: { marginTop: 8, paddingTop: 7, borderTop: `1px solid ${HX.line}` },
+  metaLine: { display: "flex", justifyContent: "space-between", fontFamily: "'Poppins', sans-serif", fontSize: 11, color: HX.muted, padding: "1.5px 0", fontWeight: 400 },
+  footNote: { fontSize: 11.5, color: "#8a98a8", marginTop: 16, lineHeight: 1.6, borderTop: `1px solid ${HX.line}`, paddingTop: 12, fontWeight: 300 },
+};
+
+// ============================================================
+//  CURRENT SALES DASHBOARD  (Actuals — WK23 2026)
+//  Source: Weekly Sales Report WK23 + Branch FCST Monthly Tracking
+// ============================================================
+const DASH = {
+  asOf: "WK23 · June 2026",
+  // EV / STB / BT YTD actuals (GBP, units)
+  ev: { ytdQty: 286, ytdRev: 103188, bpQty: 9268, bpRev: 4759122 },
+  stb: { ytdQty: 4495, ytdRev: 740072, bpQty: 20280, bpRev: 3102840 },
+  grand: { ytdRev: 843260, bpRev: 7861962 },
+  // EV monthly actual vs target (Jan–Dec)
+  months: ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],
+  evActual: [73, 17, 37, 78, 65, 16, null, null, null, null, null, null],
+  evTarget: [125, 180, 227, 115, 347, 461, 635, 782, 1015, 1439, 1692, 1778],
+  // EV category: YTD actual vs annual BP target (units) — consolidated channels
+  categories: [
+    { label: "Wholesaler (Yesss, CEF)", actual: 87, target: 4819 },
+    { label: "Distributor (Stearn, Argos)", actual: 67, target: 600 },
+    { label: "Dealer Group (BYD Harmony, CG)", actual: 31, target: 1400 },
+    { label: "eCommerce", actual: 18, target: 272 },
+    { label: "B2B (ChargedEV)", actual: 56, target: 3705 },
+  ],
+  // Product mix (retail sales units, from stock summary)
+  mix: [
+    { label: "MX7 Socket", units: 139 },
+    { label: "MX7 5M", units: 96 },
+    { label: "MX7 7.5M", units: 75 },
+    { label: "EQ7 4M", units: 31 },
+    { label: "EQ7 7M", units: 33 },
+    { label: "EQ Pro / MX Pro", units: 20 },
+  ],
+  // Stock on hand (key SKUs)
+  stock: [
+    { label: "MX7 Socket", qty: 343 },
+    { label: "MX7 5M", qty: 391 },
+    { label: "MX7 7.5M", qty: 415 },
+    { label: "EQ7 4M", qty: 40 },
+    { label: "EQ7 7M", qty: 55 },
+    { label: "MX Pro 22kW", qty: 25 },
+  ],
+};
+
+// Parse the published "Monthly Tracking" CSV into dashboard data.
+// Robust to the sheet's layout: category Target/Actual rows + Grand Total + branch detail.
+function parseMonthlyCSV(text) {
+  // simple CSV row splitter handling quoted commas
+  const rows = text.split(/\r?\n/).map((line) => {
+    const out = []; let cur = ""; let q = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') q = !q;
+      else if (ch === "," && !q) { out.push(cur); cur = ""; }
+      else cur += ch;
+    }
+    out.push(cur);
+    return out.map((s) => s.trim());
+  });
+  const num = (v) => { const n = parseFloat(String(v).replace(/[, ]/g, "")); return isNaN(n) ? 0 : n; };
+
+  // EV blended price & STB price come from CONFIG
+  const evP = evBlended();
+
+  // --- category section: rows where col2 in known categories with Target/Actual in col3 ---
+  // We aggregate ACTUAL monthly (cols index 3..14 = Jan..Dec) per category label (col1).
+  const catActual = {}; // label -> total actual units
+  let grandActualMonthly = new Array(12).fill(0);
+
+  rows.forEach((r) => {
+    const tag = (r[2] || "").toLowerCase();
+    const label = r[1] || "";
+    if (tag === "actual" && label && r.length >= 15) {
+      const monthly = r.slice(3, 15).map(num);
+      const tot = monthly.reduce((a, b) => a + b, 0);
+      if (label) catActual[label] = (catActual[label] || 0) + tot;
+    }
+    if ((r[0] || "").toLowerCase() === "grand total" && tag === "actual") {
+      grandActualMonthly = r.slice(3, 15).map(num);
+    }
+  });
+
+  // --- branch detail section: consolidate channels by wholesaler name (col0) ---
+  // Build map from the "Actual Sales detail" block: col0 = Wholesaler, last numeric = total
+  const chan = { wholesaler: 0, distributor: 0, dealer: 0, ecommerce: 0, b2b: 0 };
+  let curWholesaler = "";
+  rows.forEach((r) => {
+    const w = (r[0] || "").trim();
+    if (w) curWholesaler = w;
+    const key = (curWholesaler || "").toLowerCase();
+    // total is the last non-empty numeric cell in the row (cols 3..15)
+    const monthly = r.slice(3, 15).map(num);
+    const tot = monthly.reduce((a, b) => a + b, 0);
+    if (tot <= 0) return;
+    if (key.includes("yesss") || key.includes("cef")) chan.wholesaler += tot;
+    else if (key.includes("stearn") || key.includes("argos")) chan.distributor += tot;
+    else if (key.includes("byd")) chan.dealer += tot;
+    else if (key.includes("kelvelec")) chan.distributor += tot; // repeat acct → distributor bucket
+    else if (key.includes("etc") || key.includes("charged")) chan.b2b += tot;
+    else if (key.includes("ecommerce") || key.includes("online")) chan.ecommerce += tot;
+  });
+
+  const evMonthlyActual = grandActualMonthly.map((v) => (v > 0 ? v : null));
+  const evUnits = grandActualMonthly.reduce((a, b) => a + b, 0);
+
+  return {
+    evMonthlyActual,
+    evUnits,
+    evRev: evUnits * evP,
+    categories: [
+      { label: "Wholesaler (Yesss, CEF)", actual: chan.wholesaler, target: 4819 },
+      { label: "Distributor (Stearn, Argos)", actual: chan.distributor, target: 600 },
+      { label: "Dealer Group (BYD Harmony, CG)", actual: chan.dealer, target: 1400 },
+      { label: "eCommerce", actual: chan.ecommerce, target: 272 },
+      { label: "B2B (ChargedEV)", actual: chan.b2b, target: 3705 },
+    ],
+  };
+}
+
+function Dashboard() {
+  const [csvUrl, setCsvUrl] = useState("");
+  const [live, setLive] = useState(null);
+  const [status, setStatus] = useState("");
+
+  const loadCsv = async (url) => {
+    if (!url) return;
+    setStatus("Loading…");
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const text = await res.text();
+      const parsed = parseMonthlyCSV(text);
+      setLive(parsed);
+      setStatus("Connected · updated " + new Date().toLocaleTimeString());
+    } catch (e) {
+      setStatus("Could not load CSV — check the published link. Showing default data.");
+      setLive(null);
+    }
+  };
+
+  // merge live data over the static DASH defaults
+  const d = useMemo(() => {
+    const base = DASH;
+    if (!live) return base;
+    return {
+      ...base,
+      ev: { ...base.ev, ytdQty: live.evUnits || base.ev.ytdQty, ytdRev: live.evRev || base.ev.ytdRev },
+      grand: { ...base.grand, ytdRev: (live.evRev || base.ev.ytdRev) + base.stb.ytdRev },
+      evActual: live.evMonthlyActual && live.evMonthlyActual.some((x) => x) ? live.evMonthlyActual : base.evActual,
+      categories: live.categories && live.categories.some((c) => c.actual > 0) ? live.categories : base.categories,
+    };
+  }, [live]);
+
+  const pct = (a, b) => (b ? (a / b) * 100 : 0);
+  const evAch = pct(d.ev.ytdRev, d.ev.bpRev);
+  const stbAch = pct(d.stb.ytdRev, d.stb.bpRev);
+  const grandAch = pct(d.grand.ytdRev, d.grand.bpRev);
+  const maxCat = Math.max(...d.categories.map((c) => c.target));
+  const maxMonth = Math.max(...d.evTarget);
+  const totalMix = d.mix.reduce((s, m) => s + m.units, 0);
+  const fmtGBP0 = (n) => "£" + Math.round(n).toLocaleString();
+  const fmtKRW0 = (n) => "₩" + Math.round(n * getFX()).toLocaleString();
+
+  const KPI = ({ label, value, sub, ach, accent }) => (
+    <div style={D.kpi}>
+      <div style={D.kpiLabel}>{label}</div>
+      <div style={{ ...D.kpiVal, color: accent || HX.indigo }}>{value}</div>
+      <div style={D.kpiSub}>{sub}</div>
+      {ach !== undefined && (
+        <div style={D.kpiBarWrap}>
+          <div style={{ ...D.kpiBar, width: `${Math.min(ach, 100)}%`, background: accent || HX.azure }} />
+          <span style={D.kpiAch}>{ach.toFixed(1)}% of BP</span>
+        </div>
+      )}
+    </div>
+  );
+
+  return (
+    <div>
+      <div style={DL.connBar}>
+        <div style={DL.connInfo}>
+          <span style={DL.connDot(live)} />
+          <span style={DL.connTitle}>Google Sheet Live Link</span>
+          <span style={DL.connStatus}>{status || (live ? "Connected" : "Not connected — showing default WK23 data")}</span>
+        </div>
+        <div style={DL.connControls}>
+          <input
+            style={DL.connInput}
+            placeholder="Paste published CSV link (…/pub?gid=…&single=true&output=csv)"
+            value={csvUrl}
+            onChange={(e) => setCsvUrl(e.target.value)}
+          />
+          <button style={DL.connBtn} onClick={() => loadCsv(csvUrl)}>Connect</button>
+          <button style={DL.connBtnGhost} onClick={() => loadCsv(csvUrl)} title="Refresh">↻</button>
+        </div>
+      </div>
+      <div style={D.kpiRow}>
+        <KPI label="Grand Total · YTD Revenue" value={fmtGBP0(d.grand.ytdRev)} sub={fmtKRW0(d.grand.ytdRev) + ` · BP ${fmtGBP0(d.grand.bpRev)}`} ach={grandAch} accent={HX.indigo} />
+        <KPI label="EV · YTD" value={fmtGBP0(d.ev.ytdRev)} sub={`${d.ev.ytdQty.toLocaleString()} units · BP ${d.ev.bpQty.toLocaleString()}`} ach={evAch} accent={HX.azure} />
+        <KPI label="STB Freely · YTD" value={fmtGBP0(d.stb.ytdRev)} sub={`${d.stb.ytdQty.toLocaleString()} units · BP ${d.stb.bpQty.toLocaleString()}`} ach={stbAch} accent={HX.forest} />
+        <KPI label="EV YTD Units" value={d.ev.ytdQty.toLocaleString() + " units"} sub={`Avg ${Math.round(d.ev.ytdQty / 6)}/mo · latest Jun 16`} accent={HX.azure} />
+      </div>
+
+      <div style={D.grid2}>
+        {/* Monthly EV trend */}
+        <section style={S.panel}>
+          <h2 style={S.h2}>EV Monthly Actual vs Target (units)</h2>
+          <div style={D.chart}>
+            {d.months.map((m, i) => {
+              const t = d.evTarget[i];
+              const a = d.evActual[i];
+              return (
+                <div key={m} style={D.barCol}>
+                  <div style={D.barStack}>
+                    <div style={{ ...D.barTarget, height: `${(t / maxMonth) * 100}%` }} title={`Target ${t}`} />
+                    {a !== null && (
+                      <div style={{ ...D.barActual, height: `${(a / maxMonth) * 100}%` }} title={`Actual ${a}`} />
+                    )}
+                  </div>
+                  <div style={D.barLabel}>{m}</div>
+                </div>
+              );
+            })}
+          </div>
+          <div style={D.legend}>
+            <span><i style={{ ...D.dot, background: "#c4d0dc" }} /> Target</span>
+            <span><i style={{ ...D.dot, background: HX.azure }} /> Actual</span>
+          </div>
+        </section>
+
+        {/* Product mix donut-ish bars */}
+        <section style={S.panel}>
+          <h2 style={S.h2}>Product Mix (Retail sales {totalMix} units)</h2>
+          {d.mix.map((m, i) => {
+            const p = (m.units / totalMix) * 100;
+            const cols = [HX.indigo, HX.azure, HX.forest, "#3a6ea5", "#5fa8a0", "#9bb0c2"];
+            return (
+              <div key={m.label} style={D.mixRow}>
+                <span style={D.mixLabel}>{m.label}</span>
+                <div style={D.mixTrack}>
+                  <div style={{ ...D.mixFill, width: `${p}%`, background: cols[i % cols.length] }} />
+                </div>
+                <span style={D.mixVal}>{m.units} · {p.toFixed(0)}%</span>
+              </div>
+            );
+          })}
+        </section>
+      </div>
+
+      {/* Category achievement */}
+      <section style={S.panel}>
+        <h2 style={S.h2}>EV BP Achievement by Channel (YTD Actual vs Annual Target, units)</h2>
+        <div style={D.catGrid}>
+          {d.categories.map((c) => {
+            const ach = pct(c.actual, c.target);
+            return (
+              <div key={c.label} style={D.catRow}>
+                <span style={D.catLabel}>{c.label}</span>
+                <div style={D.catTrack}>
+                  <div style={{ ...D.catTargetMark, width: `${(c.target / maxCat) * 100}%` }} />
+                  <div style={{ ...D.catActualBar, width: `${(c.actual / maxCat) * 100}%` }} />
+                </div>
+                <span style={D.catVal}>{c.actual}/{c.target.toLocaleString()} · {ach.toFixed(0)}%</span>
+              </div>
+            );
+          })}
+        </div>
+        <div style={D.legend}>
+          <span><i style={{ ...D.dot, background: "#e3e9ef" }} /> Annual Target</span>
+          <span><i style={{ ...D.dot, background: HX.azure }} /> YTD Actual</span>
+        </div>
+        <div style={S.footNote}>
+          Data as of {d.asOf}. Source — Weekly Sales Report WK23 · Branch FCST Monthly Tracking.
+          EV Socket £{PRICE.ev_socket} / 5M £{PRICE.ev_5m} / 7.5M £{PRICE.ev_75m} · STB FHR-6000T £{PRICE.stb_fhr} · FX {getFX()} KRW/£.
+        </div>
+      </section>
+    </div>
+  );
+}
+
+// ============================================================
+//  SEGMENT SIMULATION (2026 only)
+//  Existing channel run-rate + add pipeline customers
+// ============================================================
+const SEG_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const SEG_BASE = [
+  { key: "wholesaler", label: "Wholesaler (Yesss / CEF)", ytd: 87, runRate: 20, product: "MX7", color: "#001C3D" },
+  { key: "distributor", label: "Distributor (Stearn / Argos)", ytd: 67, runRate: 12, product: "MX7", color: "#00B1A1" },
+  { key: "repeat", label: "Repeat (Kelvelec etc.)", ytd: 10, runRate: 5, product: "MX7", color: "#163E35" },
+  { key: "dealer_base", label: "Dealer (BYD)", ytd: 31, runRate: 15, product: "MX7", color: "#3a6ea5" },
+  { key: "b2b_base", label: "B2B (ChargedEV)", ytd: 56, runRate: 8, product: "MX7", color: "#5fa8a0" },
+  { key: "ecom", label: "eCommerce", ytd: 18, runRate: 4, product: "MX7", color: "#9bb0c2" },
+];
+const PIPELINE_TYPES = ["Wholesaler", "Distributor", "Installer", "Dealer", "Fleet Manager", "Rental / Leasing", "MDU / Housing", "CPO", "Other B2B"];
+
+function SegmentSim() {
+  const [rr, setRr] = useState(() => Object.fromEntries(SEG_BASE.map((s) => [s.key, s.runRate])));
+  const [pipe, setPipe] = useState([
+    { id: 1, name: "BYD (additional dealers)", type: "Dealer", monthly: 20, startMonth: 7, product: "MX7" },
+    { id: 2, name: "Fleet pilot", type: "Fleet Manager", monthly: 10, startMonth: 8, product: "MX7" },
+    { id: 3, name: "MDU project", type: "MDU / Housing", monthly: 15, startMonth: 9, product: "MX22" },
+  ]);
+  const [nid, setNid] = useState(4);
+
+  const addPipe = () => {
+    setPipe((p) => [...p, { id: nid, name: "New customer", type: "Dealer", monthly: 10, startMonth: 7, product: "MX7" }]);
+    setNid(nid + 1);
+  };
+  const updPipe = (id, k, v) => setPipe((p) => p.map((x) => (x.id === id ? { ...x, [k]: v } : x)));
+  const delPipe = (id) => setPipe((p) => p.filter((x) => x.id !== id));
+
+  const calc = useMemo(() => {
+    const monthlyUnits = SEG_MONTHS.map(() => 0);
+    const monthlyRev = SEG_MONTHS.map(() => 0);
+    const segTotals = {};
+    SEG_BASE.forEach((s) => {
+      let u = 0;
+      for (let m = 0; m < 12; m++) {
+        const units = m < 6 ? s.ytd / 6 : rr[s.key];
+        u += units;
+        monthlyUnits[m] += units;
+        monthlyRev[m] += units * prodPrice(s.product);
+      }
+      segTotals[s.key] = { label: s.label, units: u, rev: u * prodPrice(s.product), color: s.color };
+    });
+    const pipeTotals = pipe.map((c) => {
+      let u = 0;
+      for (let m = 0; m < 12; m++) {
+        if (m + 1 >= c.startMonth) {
+          u += c.monthly;
+          monthlyUnits[m] += c.monthly;
+          monthlyRev[m] += c.monthly * prodPrice(c.product);
+        }
+      }
+      return { ...c, units: u, rev: u * prodPrice(c.product) };
+    });
+    const totUnits = monthlyUnits.reduce((a, b) => a + b, 0);
+    const totRev = monthlyRev.reduce((a, b) => a + b, 0);
+    return { monthlyUnits, monthlyRev, segTotals, pipeTotals, totUnits, totRev };
+  }, [rr, pipe]);
+
+  const maxMonthly = Math.max(...calc.monthlyUnits, 1);
+  const fmtGBP0 = (n) => "£" + Math.round(n).toLocaleString();
+  const baseTotal = SEG_BASE.reduce((a, s) => a + calc.segTotals[s.key].units, 0);
+  const pipeTotal = calc.pipeTotals.reduce((a, c) => a + c.units, 0);
+
+  return (
+    <div>
+      <div style={D.kpiRow}>
+        <div style={D.kpi}>
+          <div style={D.kpiLabel}>2026 Total Units</div>
+          <div style={{ ...D.kpiVal, color: HX.indigo }}>{Math.round(calc.totUnits).toLocaleString()}</div>
+          <div style={D.kpiSub}>Existing {Math.round(baseTotal).toLocaleString()} + Pipeline {Math.round(pipeTotal).toLocaleString()}</div>
+        </div>
+        <div style={D.kpi}>
+          <div style={D.kpiLabel}>2026 Total Revenue</div>
+          <div style={{ ...D.kpiVal, color: HX.azure }}>{fmtGBP0(calc.totRev)}</div>
+          <div style={D.kpiSub}>{"₩" + Math.round(calc.totRev * getFX()).toLocaleString()}</div>
+        </div>
+        <div style={D.kpi}>
+          <div style={D.kpiLabel}>Pipeline Contribution</div>
+          <div style={{ ...D.kpiVal, color: HX.forest }}>{calc.totUnits ? ((pipeTotal / calc.totUnits) * 100).toFixed(0) : 0}%</div>
+          <div style={D.kpiSub}>{calc.pipeTotals.length} customers added</div>
+        </div>
+        <div style={D.kpi}>
+          <div style={D.kpiLabel}>Avg Monthly (H2)</div>
+          <div style={{ ...D.kpiVal, color: HX.indigo }}>{Math.round(calc.monthlyUnits.slice(6).reduce((a, b) => a + b, 0) / 6).toLocaleString()}</div>
+          <div style={D.kpiSub}>units / month (Jul–Dec)</div>
+        </div>
+      </div>
+
+      <section style={S.panel}>
+        <h2 style={S.h2}>2026 Monthly Volume (Existing + Pipeline)</h2>
+        <div style={D.chart}>
+          {SEG_MONTHS.map((m, i) => (
+            <div key={m} style={D.barCol}>
+              <div style={D.barStack}>
+                <div style={{ ...D.barActual, width: "60%", height: `${(calc.monthlyUnits[i] / maxMonthly) * 100}%`, background: i < 6 ? "#c4d0dc" : HX.azure }}
+                  title={`${Math.round(calc.monthlyUnits[i])} units`} />
+              </div>
+              <div style={D.barLabel}>{m}</div>
+              <div style={SG.barNum}>{Math.round(calc.monthlyUnits[i])}</div>
+            </div>
+          ))}
+        </div>
+        <div style={D.legend}>
+          <span><i style={{ ...D.dot, background: "#c4d0dc" }} /> Jan–Jun (actual run-rate)</span>
+          <span><i style={{ ...D.dot, background: HX.azure }} /> Jul–Dec (forecast)</span>
+        </div>
+      </section>
+
+      <div style={D.grid2}>
+        <section style={S.panel}>
+          <h2 style={S.h2}>Existing Channels — H2 Run-Rate</h2>
+          <div style={S.panelNote}>Jan–Jun uses actual YTD; sliders set Jul–Dec monthly units per channel.</div>
+          {SEG_BASE.map((s) => (
+            <div key={s.key} style={S.sliderRow}>
+              <div style={S.sliderHead}>
+                <span style={S.sliderName}><i style={{ ...D.dot, background: s.color }} />{s.label}</span>
+                <span style={S.sliderVal}>{Math.round(calc.segTotals[s.key].units).toLocaleString()} units · {fmtGBP0(calc.segTotals[s.key].rev)}</span>
+              </div>
+              <input type="range" min="0" max="80" value={rr[s.key]}
+                onChange={(e) => setRr((p) => ({ ...p, [s.key]: +e.target.value }))} style={S.range} />
+              <div style={S.sliderSub}>YTD {s.ytd} · H2 run-rate {rr[s.key]}/mo · {s.product}</div>
+            </div>
+          ))}
+        </section>
+
+        <section style={S.panel}>
+          <div style={SG.pipeHead}>
+            <h2 style={{ ...S.h2, margin: 0 }}>Pipeline Customers</h2>
+            <button onClick={addPipe} style={SG.addBtn}>+ Add</button>
+          </div>
+          <div style={S.panelNote}>Add Wholesaler / Distributor / Installer / Dealer / Fleet / Rental·Leasing / MDU / CPO and set monthly units, start month, product.</div>
+          {pipe.map((c) => (
+            <div key={c.id} style={SG.pipeCard}>
+              <div style={SG.pipeRow1}>
+                <input value={c.name} onChange={(e) => updPipe(c.id, "name", e.target.value)} style={SG.nameInput} />
+                <button onClick={() => delPipe(c.id)} style={SG.delBtn}>✕</button>
+              </div>
+              <div style={SG.pipeRow2}>
+                <select value={c.type} onChange={(e) => updPipe(c.id, "type", e.target.value)} style={SG.sel}>
+                  {PIPELINE_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
+                </select>
+                <select value={c.product} onChange={(e) => updPipe(c.id, "product", e.target.value)} style={SG.selSm}>
+                  <option value="MX7">MX7</option>
+                  <option value="MX22">MX22</option>
+                </select>
+              </div>
+              <div style={SG.pipeRow3}>
+                <label style={SG.miniLabel}>Units/mo
+                  <input type="number" min="0" value={c.monthly} onChange={(e) => updPipe(c.id, "monthly", +e.target.value)} style={SG.numInput} />
+                </label>
+                <label style={SG.miniLabel}>Start
+                  <select value={c.startMonth} onChange={(e) => updPipe(c.id, "startMonth", +e.target.value)} style={SG.selSm}>
+                    {SEG_MONTHS.map((m, i) => <option key={m} value={i + 1}>{m}</option>)}
+                  </select>
+                </label>
+                <span style={SG.pipeResult}>{(() => { const ct = calc.pipeTotals.find((x) => x.id === c.id); return ct ? `${ct.units.toLocaleString()} units · ${fmtGBP0(ct.rev)}` : ""; })()}</span>
+              </div>
+            </div>
+          ))}
+        </section>
+      </div>
+
+      <section style={S.panel}>
+        <h2 style={S.h2}>2026 Segment Summary</h2>
+        <div style={SG.tbl}>
+          <div style={{ ...SG.tr, ...SG.trHead }}>
+            <span>Segment</span><span style={SG.tRight}>Units</span><span style={SG.tRight}>Revenue (£)</span><span style={SG.tRight}>Share</span>
+          </div>
+          {SEG_BASE.map((s) => {
+            const t = calc.segTotals[s.key];
+            return (
+              <div key={s.key} style={SG.tr}>
+                <span><i style={{ ...D.dot, background: s.color }} />{t.label}</span>
+                <span style={SG.tRight}>{Math.round(t.units).toLocaleString()}</span>
+                <span style={SG.tRight}>{fmtGBP0(t.rev)}</span>
+                <span style={SG.tRight}>{((t.units / calc.totUnits) * 100).toFixed(0)}%</span>
+              </div>
+            );
+          })}
+          {calc.pipeTotals.map((c) => (
+            <div key={c.id} style={SG.tr}>
+              <span><i style={{ ...D.dot, background: HX.sunshine }} />{c.name} <em style={SG.typeTag}>{c.type}</em></span>
+              <span style={SG.tRight}>{c.units.toLocaleString()}</span>
+              <span style={SG.tRight}>{fmtGBP0(c.rev)}</span>
+              <span style={SG.tRight}>{calc.totUnits ? ((c.units / calc.totUnits) * 100).toFixed(0) : 0}%</span>
+            </div>
+          ))}
+          <div style={{ ...SG.tr, ...SG.trTotal }}>
+            <span>Total</span>
+            <span style={SG.tRight}>{Math.round(calc.totUnits).toLocaleString()}</span>
+            <span style={SG.tRight}>{fmtGBP0(calc.totRev)}</span>
+            <span style={SG.tRight}>100%</span>
+          </div>
+        </div>
+        <div style={S.footNote}>
+          2026 only. MX7 blended £{prodPrice("MX7").toFixed(0)}/unit · MX22 £{prodPrice("MX22").toFixed(0)}/unit · FX {getFX()} KRW/£.
+          Existing channels: Jan–Jun actual + adjustable H2 run-rate. Pipeline: monthly units from start month to Dec.
+        </div>
+      </section>
+    </div>
+  );
+}
+
+// ============================================================
+//  SETTINGS — central pricing / margin / FX (referenced by all pages)
+// ============================================================
+function Settings({ onChange }) {
+  const [, force] = useState(0);
+  const set = (path, v) => {
+    const num = v === "" ? 0 : +v;
+    const [grp, key] = path.split(".");
+    CONFIG[grp][key] = num;
+    force((x) => x + 1);
+    onChange && onChange();
+  };
+
+  const priceRows = [
+    ["MX7 Socket", "price.ev_socket"],
+    ["MX7 5M", "price.ev_5m"],
+    ["MX7 7.5M", "price.ev_75m"],
+    ["MX Pro 22kW (MX22)", "price.ev_22kw"],
+    ["STB FHR-6000T", "price.stb_fhr"],
+  ];
+  const mixRows = [
+    ["Socket weight", "mix.socket"],
+    ["5M weight", "mix.c5m"],
+    ["7.5M weight", "mix.c75m"],
+  ];
+  const gmRows = [
+    ["EV", "gm.ev"],
+    ["STB", "gm.stb"],
+    ["BT", "gm.bt"],
+  ];
+  const mixSum = CONFIG.mix.socket + CONFIG.mix.c5m + CONFIG.mix.c75m;
+
+  const Field = ({ label, path, step, suffix, prefix }) => {
+    const [grp, key] = path.split(".");
+    return (
+      <div style={ST.field}>
+        <label style={ST.fieldLabel}>{label}</label>
+        <div style={ST.inputWrap}>
+          {prefix && <span style={ST.affix}>{prefix}</span>}
+          <input type="number" step={step || "0.01"} value={CONFIG[grp][key]}
+            onChange={(e) => set(path, e.target.value)} style={ST.input} />
+          {suffix && <span style={ST.affix}>{suffix}</span>}
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div>
+      <div style={ST.banner}>
+        These values are the single source of truth. Editing them updates the Dashboard, Segment Simulation, and 3-Year Simulator instantly.
+      </div>
+
+      <div style={D.grid2}>
+        <section style={S.panel}>
+          <h2 style={S.h2}>Model Prices (GBP)</h2>
+          <div style={S.panelNote}>Per-unit selling price by model.</div>
+          {priceRows.map(([l, p]) => <Field key={p} label={l} path={p} prefix="£" step="0.01" />)}
+          <div style={{ ...S.catTotal, marginTop: 16 }}>
+            <span style={S.catTotalLabel}>EV Home Blended</span>
+            <span style={S.catTotalVal}>£{evBlended().toFixed(2)}/unit</span>
+          </div>
+        </section>
+
+        <section style={S.panel}>
+          <h2 style={S.h2}>Margin Rate & FX</h2>
+          <div style={S.panelNote}>Gross margin by line and KRW/GBP exchange rate.</div>
+          <div style={S.blockLabel}>Gross Margin (%)</div>
+          {gmRows.map(([l, p]) => {
+            const [grp, key] = p.split(".");
+            return (
+              <div key={p} style={ST.field}>
+                <label style={ST.fieldLabel}>{l}</label>
+                <div style={ST.inputWrap}>
+                  <input type="number" step="1" value={+(CONFIG[grp][key] * 100).toFixed(1)}
+                    onChange={(e) => { CONFIG[grp][key] = (e.target.value === "" ? 0 : +e.target.value) / 100; force((x) => x + 1); onChange && onChange(); }}
+                    style={ST.input} />
+                  <span style={ST.affix}>%</span>
+                </div>
+              </div>
+            );
+          })}
+          <div style={{ ...S.blockLabel, marginTop: 16 }}>Exchange Rate</div>
+          <div style={ST.field}>
+            <label style={ST.fieldLabel}>KRW per GBP</label>
+            <div style={ST.inputWrap}>
+              <span style={ST.affix}>₩</span>
+              <input type="number" step="0.001" value={CONFIG.fx}
+                onChange={(e) => { CONFIG.fx = e.target.value === "" ? 0 : +e.target.value; force((x) => x + 1); onChange && onChange(); }}
+                style={ST.input} />
+            </div>
+          </div>
+
+          <div style={{ ...S.blockLabel, marginTop: 16 }}>EV Home Mix Weights</div>
+          <div style={S.panelNote}>How MX7 sales split across variants (used for the blended EV price). Sum: {(mixSum * 100).toFixed(0)}%{Math.abs(mixSum - 1) > 0.001 ? " ⚠ should be 100%" : " ✓"}</div>
+          {mixRows.map(([l, p]) => <Field key={p} label={l} path={p} step="0.05" suffix="" />)}
+        </section>
+      </div>
+
+      <section style={S.panel}>
+        <h2 style={S.h2}>Current Effective Values</h2>
+        <div style={ST.summaryGrid}>
+          <div style={ST.sumCard}><div style={ST.sumLabel}>EV Blended</div><div style={ST.sumVal}>£{evBlended().toFixed(2)}</div></div>
+          <div style={ST.sumCard}><div style={ST.sumLabel}>MX22 / Commercial</div><div style={ST.sumVal}>£{PRICE.ev_22kw.toFixed(0)}</div></div>
+          <div style={ST.sumCard}><div style={ST.sumLabel}>STB</div><div style={ST.sumVal}>£{PRICE.stb_fhr.toFixed(0)}</div></div>
+          <div style={ST.sumCard}><div style={ST.sumLabel}>EV / STB / BT GM</div><div style={ST.sumVal}>{(GM.ev*100).toFixed(0)}/{(GM.stb*100).toFixed(0)}/{(GM.bt*100).toFixed(0)}%</div></div>
+          <div style={ST.sumCard}><div style={ST.sumLabel}>FX</div><div style={ST.sumVal}>₩{getFX().toLocaleString()}</div></div>
+        </div>
+        <div style={S.footNote}>
+          Changes apply immediately across all tabs for this session. Reload restores defaults (MX7 Socket £332.14 / 5M £342.37 / 7.5M £357.73 · MX22 £579 · STB £153 · GM 20/20/100% · FX 1810.195).
+        </div>
+      </section>
+    </div>
+  );
+}
+
+
+function HUKApp() {
+  const [tab, setTab] = useState("dashboard");
+  const [, setBump] = useState(0);
+  const onConfigChange = () => setBump((b) => b + 1);
+  return (
+    <div style={S.page}>
+      <style>{CSS}</style>
+      <div style={D.appHeader}>
+        <div>
+          <div style={D.appKicker}>HUMAX UK · EV CHARGING</div>
+          <h1 style={D.appTitle}>Revenue & Scenario Console</h1>
+        </div>
+        <div style={D.tabGroup}>
+          <button onClick={() => setTab("dashboard")}
+            style={{ ...D.tab, ...(tab === "dashboard" ? D.tabActive : {}) }}>
+            Sales Dashboard
+          </button>
+          <button onClick={() => setTab("segment")}
+            style={{ ...D.tab, ...(tab === "segment" ? D.tabActive : {}) }}>
+            Segment Simulation
+          </button>
+          <button onClick={() => setTab("simulator")}
+            style={{ ...D.tab, ...(tab === "simulator" ? D.tabActive : {}) }}>
+            3-Year Simulator
+          </button>
+          <button onClick={() => setTab("settings")}
+            style={{ ...D.tab, ...(tab === "settings" ? D.tabActive : {}) }}>
+            ⚙ Settings
+          </button>
+        </div>
+      </div>
+      {tab === "dashboard" ? <Dashboard /> : tab === "segment" ? <SegmentSim /> : tab === "simulator" ? <Simulator embedded /> : <Settings onChange={onConfigChange} />}
+    </div>
+  );
+}
+
+const D = {
+  appHeader: { display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 16, background: HX.indigo, borderRadius: 16, padding: "20px 28px", marginBottom: 22, boxShadow: "0 8px 28px rgba(0,28,61,.18)" },
+  appKicker: { fontSize: 11, letterSpacing: 3, color: HX.azure, fontWeight: 600, textTransform: "uppercase" },
+  appTitle: { fontFamily: "'Poppins', sans-serif", fontSize: 26, fontWeight: 700, color: "#fff", margin: "4px 0 0", letterSpacing: -0.3 },
+  tabGroup: { display: "flex", gap: 4, background: "rgba(255,255,255,.1)", padding: 4, borderRadius: 12 },
+  tab: { fontFamily: "'Poppins', sans-serif", fontSize: 13.5, fontWeight: 600, padding: "9px 20px", border: "none", borderRadius: 8, background: "transparent", color: "#aebccd", cursor: "pointer" },
+  tabActive: { background: HX.azure, color: HX.indigo },
+  kpiRow: { display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 16, marginBottom: 20 },
+  kpi: { background: HX.card, border: `1px solid ${HX.line}`, borderRadius: 16, padding: "18px 20px", boxShadow: "0 4px 18px rgba(0,28,61,.05)" },
+  kpiLabel: { fontSize: 11.5, color: HX.muted, fontWeight: 500, textTransform: "uppercase", letterSpacing: 0.5 },
+  kpiVal: { fontFamily: "'Poppins', sans-serif", fontSize: 27, fontWeight: 700, lineHeight: 1.2, margin: "6px 0 2px" },
+  kpiSub: { fontSize: 11.5, color: "#8a98a8", fontWeight: 300 },
+  kpiBarWrap: { marginTop: 10, position: "relative", height: 16, background: "#eef2f6", borderRadius: 8, overflow: "hidden" },
+  kpiBar: { position: "absolute", left: 0, top: 0, bottom: 0, borderRadius: 8 },
+  kpiAch: { position: "absolute", right: 8, top: 1, fontSize: 10, fontWeight: 600, color: HX.indigo, lineHeight: "15px" },
+  grid2: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20, marginBottom: 20 },
+  chart: { display: "flex", alignItems: "flex-end", gap: 8, height: 200, padding: "10px 0", borderBottom: `1px solid ${HX.line}` },
+  barCol: { flex: 1, display: "flex", flexDirection: "column", alignItems: "center", height: "100%", justifyContent: "flex-end" },
+  barStack: { position: "relative", width: "100%", height: "100%", display: "flex", alignItems: "flex-end", justifyContent: "center" },
+  barTarget: { position: "absolute", bottom: 0, width: "70%", background: "#c4d0dc", borderRadius: "3px 3px 0 0" },
+  barActual: { position: "relative", width: "44%", background: HX.azure, borderRadius: "3px 3px 0 0", zIndex: 1 },
+  barLabel: { fontSize: 10, color: HX.muted, marginTop: 5 },
+  legend: { display: "flex", gap: 18, marginTop: 12, fontSize: 11.5, color: HX.muted },
+  dot: { display: "inline-block", width: 10, height: 10, borderRadius: 3, marginRight: 5, verticalAlign: "middle" },
+  mixRow: { display: "grid", gridTemplateColumns: "1.1fr 2fr 0.9fr", alignItems: "center", gap: 10, marginBottom: 11 },
+  mixLabel: { fontSize: 12.5, fontWeight: 500 },
+  mixTrack: { height: 14, background: "#eef2f6", borderRadius: 7, overflow: "hidden" },
+  mixFill: { height: "100%", borderRadius: 7 },
+  mixVal: { fontSize: 11.5, color: HX.muted, textAlign: "right", fontWeight: 500 },
+  catGrid: { marginTop: 6 },
+  catRow: { display: "grid", gridTemplateColumns: "1.3fr 2.2fr 1.1fr", alignItems: "center", gap: 12, marginBottom: 12 },
+  catLabel: { fontSize: 12.5, fontWeight: 500 },
+  catTrack: { position: "relative", height: 18, background: "#f3f6f9", borderRadius: 6 },
+  catTargetMark: { position: "absolute", left: 0, top: 0, bottom: 0, background: "#e3e9ef", borderRadius: 6 },
+  catActualBar: { position: "absolute", left: 0, top: 0, bottom: 0, background: HX.azure, borderRadius: 6, minWidth: 3 },
+  catVal: { fontSize: 11.5, color: HX.muted, textAlign: "right", fontWeight: 500 },
+  stockRow: { display: "grid", gridTemplateColumns: "repeat(6, 1fr)", gap: 12, marginTop: 6 },
+  stockCard: { background: "#f7fafb", border: `1px solid ${HX.line}`, borderRadius: 12, padding: "16px 12px", textAlign: "center" },
+  stockQty: { fontFamily: "'Poppins', sans-serif", fontSize: 24, fontWeight: 700, color: HX.indigo },
+  stockLabel: { fontSize: 11, color: HX.muted, marginTop: 4 },
+};
+
+const SG = {
+  barNum: { fontSize: 9.5, color: HX.muted, marginTop: 2, fontWeight: 500 },
+  pipeHead: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 2 },
+  addBtn: { fontFamily: "'Poppins', sans-serif", fontSize: 12.5, fontWeight: 600, padding: "6px 14px", border: "none", borderRadius: 8, background: HX.azure, color: HX.indigo, cursor: "pointer" },
+  pipeCard: { background: "#f7fafb", border: `1px solid ${HX.line}`, borderRadius: 12, padding: "12px 14px", marginBottom: 10 },
+  pipeRow1: { display: "flex", gap: 8, marginBottom: 8 },
+  nameInput: { flex: 1, fontFamily: "'Poppins', sans-serif", fontSize: 13, fontWeight: 600, color: HX.indigo, border: `1px solid ${HX.line}`, borderRadius: 7, padding: "6px 10px", background: "#fff" },
+  delBtn: { border: "none", background: "#fdecec", color: "#d64545", borderRadius: 7, width: 30, cursor: "pointer", fontWeight: 700 },
+  pipeRow2: { display: "flex", gap: 8, marginBottom: 8 },
+  sel: { flex: 1, fontFamily: "'Poppins', sans-serif", fontSize: 12.5, border: `1px solid ${HX.line}`, borderRadius: 7, padding: "6px 8px", background: "#fff", color: HX.ink },
+  selSm: { fontFamily: "'Poppins', sans-serif", fontSize: 12.5, border: `1px solid ${HX.line}`, borderRadius: 7, padding: "6px 8px", background: "#fff", color: HX.ink },
+  pipeRow3: { display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" },
+  miniLabel: { fontSize: 11, color: HX.muted, display: "flex", alignItems: "center", gap: 5, fontWeight: 500 },
+  numInput: { width: 58, fontFamily: "'Poppins', sans-serif", fontSize: 12.5, border: `1px solid ${HX.line}`, borderRadius: 7, padding: "5px 8px", background: "#fff", color: HX.ink },
+  pipeResult: { marginLeft: "auto", fontFamily: "'Poppins', sans-serif", fontSize: 12.5, fontWeight: 600, color: HX.indigo },
+  tbl: { marginTop: 4 },
+  tr: { display: "grid", gridTemplateColumns: "2.4fr 1fr 1.3fr 0.8fr", padding: "8px 6px", borderBottom: `1px solid ${HX.line}`, fontSize: 13, alignItems: "center" },
+  trHead: { fontFamily: "'Poppins', sans-serif", fontSize: 11, letterSpacing: 0.5, color: HX.muted, fontWeight: 600, textTransform: "uppercase", borderBottom: `2px solid ${HX.line}` },
+  trTotal: { fontFamily: "'Poppins', sans-serif", fontWeight: 700, color: HX.indigo, borderTop: `2px solid ${HX.indigo}`, borderBottom: "none", background: "#f7fafb" },
+  tRight: { textAlign: "right", fontFamily: "'Poppins', sans-serif" },
+  typeTag: { fontStyle: "normal", fontSize: 10.5, color: HX.muted, background: "#eef2f6", padding: "1px 7px", borderRadius: 5, marginLeft: 6 },
+};
+
+const ST = {
+  banner: { background: `linear-gradient(135deg, ${HX.indigo}, ${HX.forest})`, color: "#fff", borderRadius: 14, padding: "16px 22px", marginBottom: 20, fontSize: 13.5, fontWeight: 400, lineHeight: 1.5 },
+  field: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 11, gap: 12 },
+  fieldLabel: { fontSize: 13.5, fontWeight: 500, color: HX.ink },
+  inputWrap: { display: "flex", alignItems: "center", gap: 6, background: "#fff", border: `1px solid ${HX.line}`, borderRadius: 8, padding: "2px 10px" },
+  affix: { fontSize: 12.5, color: HX.muted, fontWeight: 500 },
+  input: { width: 90, fontFamily: "'Poppins', sans-serif", fontSize: 13.5, fontWeight: 600, color: HX.indigo, border: "none", outline: "none", textAlign: "right", padding: "6px 2px", background: "transparent" },
+  summaryGrid: { display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 12, marginTop: 4 },
+  sumCard: { background: "#f7fafb", border: `1px solid ${HX.line}`, borderRadius: 12, padding: "14px 12px", textAlign: "center" },
+  sumLabel: { fontSize: 10.5, color: HX.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 5 },
+  sumVal: { fontFamily: "'Poppins', sans-serif", fontSize: 18, fontWeight: 700, color: HX.indigo },
+};
+
+const DL = {
+  connBar: { display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12, background: "#fff", border: `1px solid ${HX.line}`, borderRadius: 14, padding: "12px 18px", marginBottom: 18, boxShadow: "0 2px 12px rgba(0,28,61,.04)" },
+  connInfo: { display: "flex", alignItems: "center", gap: 10 },
+  connDot: (live) => ({ width: 9, height: 9, borderRadius: "50%", background: live ? HX.azure : "#c4d0dc", display: "inline-block", boxShadow: live ? `0 0 0 3px rgba(0,177,161,.2)` : "none" }),
+  connTitle: { fontFamily: "'Poppins', sans-serif", fontSize: 12.5, fontWeight: 600, color: HX.indigo },
+  connStatus: { fontSize: 11.5, color: HX.muted, fontWeight: 300 },
+  connControls: { display: "flex", gap: 8, alignItems: "center", flex: 1, minWidth: 300, maxWidth: 560 },
+  connInput: { flex: 1, fontFamily: "'Poppins', sans-serif", fontSize: 12, border: `1px solid ${HX.line}`, borderRadius: 8, padding: "8px 12px", background: "#f7fafb", color: HX.ink },
+  connBtn: { fontFamily: "'Poppins', sans-serif", fontSize: 12.5, fontWeight: 600, padding: "8px 16px", border: "none", borderRadius: 8, background: HX.azure, color: HX.indigo, cursor: "pointer", whiteSpace: "nowrap" },
+  connBtnGhost: { fontFamily: "'Poppins', sans-serif", fontSize: 14, fontWeight: 600, padding: "8px 12px", border: `1px solid ${HX.line}`, borderRadius: 8, background: "#fff", color: HX.indigo, cursor: "pointer" },
+};
+
+
+ReactDOM.createRoot(document.getElementById('root')).render(<HUKApp />);
+</script>
+</body>
+</html>
