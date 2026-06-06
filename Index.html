@@ -1,0 +1,1890 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>HUMAX UK — Revenue & Scenario Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js"></script>
+<style>html,body{margin:0;padding:0;background:#f5f7fa;}</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useMemo } = React;
+
+// ============================================================
+//  HUK 3-Year P&L Simulator
+//  EV (category-level) + STB (FHR-6000T) + BT maintenance
+//  Adjustable revenue scenarios & cost-reduction levers
+// ============================================================
+
+// ---- Central configuration (editable in Settings; referenced by all pages) ----
+// Mutable in-memory store. Settings page updates these; pages re-read on each render.
+const CONFIG = {
+  price: {
+    ev_socket: 332.14,
+    ev_5m: 342.37,
+    ev_75m: 357.73,
+    ev_22kw: 579.0,
+    stb_fhr: 153.0,
+  },
+  // EV home blended mix weights (must sum to 1)
+  mix: { socket: 0.5, c5m: 0.25, c75m: 0.25 },
+  gm: { ev: 0.2, stb: 0.2, bt: 1.0 }, // gross margins
+  fx: 1810.195, // KRW per GBP
+};
+// Back-compat references used throughout the app:
+const PRICE = CONFIG.price;          // object ref — mutating properties is reflected everywhere
+const GM = CONFIG.gm;                // object ref
+const getFX = () => CONFIG.fx;       // FX can change, so read via function
+const evBlended = () =>
+  CONFIG.mix.socket * PRICE.ev_socket + CONFIG.mix.c5m * PRICE.ev_5m + CONFIG.mix.c75m * PRICE.ev_75m;
+const prodPrice = (key) => (key === "MX22" ? PRICE.ev_22kw : evBlended());
+
+// ---- EV categories: 2026 BP annual target (from Monthly Tracking) ----
+// baseUnits = 2026 plan; we scale per scenario & per year
+const EV_CATEGORIES = [
+  { key: "wholesaler", label: "Wholesaler", base: 4220, note: "Yesss·CEF wholesale channel" },
+  { key: "distributor", label: "Distributor", base: 600, note: "Stearn and mid-tier distribution" },
+  { key: "ecommerce", label: "eCommerce", base: 272, note: "Argos·Online" },
+  { key: "dealer", label: "Dealer", base: 1400, note: "BYD and dealerships" },
+  { key: "fleet", label: "Fleet", base: 1500, note: "B2B Home/Commercial Fleet" },
+  { key: "cpo", label: "CPO", base: 805, note: "Commercial B2B / CPO" },
+];
+
+// scenario multipliers vs BP target (Worst/Base/Best), per year
+// 2026 anchored to realistic run-rate (Worst ≈ current pace), grows in 27/28
+const SCENARIO_MULT = {
+  worst: { 2026: 0.08, 2027: 0.16, 2028: 0.24 },
+  base: { 2026: 0.14, 2027: 0.25, 2028: 0.40 },
+  best: { 2026: 0.24, 2027: 0.40, 2028: 0.62 },
+};
+
+// STB FHR-6000T units by scenario (2026 BP = 20,280). Declines after.
+const STB_UNITS = {
+  worst: { 2026: 14196, 2027: 9000, 2028: 4500 },
+  base: { 2026: 17238, 2027: 12000, 2028: 7000 },
+  best: { 2026: 20280, 2027: 16000, 2028: 11000 },
+};
+
+// BT maintenance: £700k through 2027, removed 2028
+const BT_REV = { 2026: 700000, 2027: 700000, 2028: 0 };
+
+// Base fixed-cost budget (Jeff PL) & 2026 actual budget
+const BASE_FIXED = 2154193;
+
+const YEARS = [2026, 2027, 2028];
+const SCEN = [
+  { key: "worst", label: "Worst", color: "#d64545" },
+  { key: "base", label: "Base", color: "#00B1A1" },
+  { key: "best", label: "Best", color: "#163E35" },
+];
+
+const fmtGBP = (n) =>
+  (n < 0 ? "−£" : "£") + Math.abs(Math.round(n)).toLocaleString();
+const fmtM = (n) => (n < 0 ? "−£" : "£") + (Math.abs(n) / 1e6).toFixed(2) + "M";
+const fmtKRW = (n) =>
+  (n < 0 ? "−₩" : "₩") + Math.abs(Math.round(n * getFX())).toLocaleString();
+const r0k = (n) => Math.round(n).toLocaleString();
+
+// Map Segment Simulation inputs → 3-Year Simulator's 6 EV channels (2026 base units).
+// Reads the saved Segment Sim snapshot from localStorage (same key the Segment page saves to).
+function segmentToCatBase() {
+  let snap = null;
+  try {
+    const raw = window.localStorage.getItem("huk_segment_sim");
+    snap = raw ? JSON.parse(raw) : null;
+  } catch (e) { snap = null; }
+  if (!snap) return null;
+
+  const rr = snap.rr || {};
+  const pipe = snap.pipe || [];
+  const cats = { wholesaler: 0, distributor: 0, ecommerce: 0, dealer: 0, fleet: 0, cpo: 0 };
+
+  // existing channels: Jan-Jun actual (ytd) + Jul-Dec run-rate*6  → full-year 2026 units
+  const baseMap = {}; SEG_BASE.forEach((s) => (baseMap[s.key] = s));
+  const fullYear = (key) => {
+    const s = baseMap[key]; if (!s) return 0;
+    const h2 = (rr[key] != null ? rr[key] : s.runRate) * 6;
+    return s.ytd + h2;
+  };
+  cats.wholesaler += fullYear("wholesaler");
+  cats.distributor += fullYear("distributor"); // Stearn / Argos / Kelvelec
+  cats.ecommerce += fullYear("ecom");
+  cats.dealer += fullYear("dealer_base");
+  cats.fleet += fullYear("b2b_base"); // ChargedEV B2B base → fleet bucket
+
+  // pipeline customers: units = monthly × months from startMonth..Dec
+  pipe.forEach((c) => {
+    const months = Math.max(0, 12 - (c.startMonth - 1));
+    const u = (c.monthly || 0) * months;
+    switch (c.type) {
+      case "Wholesaler": cats.wholesaler += u; break;
+      case "Distributor": cats.distributor += u; break;
+      case "Dealer": cats.dealer += u; break;
+      case "eCommerce": cats.ecommerce += u; break;
+      case "Fleet Manager":
+      case "Rental / Leasing":
+      case "Other B2B": cats.fleet += u; break;
+      case "MDU / Housing":
+      case "CPO":
+      case "Installer": cats.cpo += u; break;
+      default: cats.fleet += u;
+    }
+  });
+  return cats;
+}
+
+function Simulator() {
+  const [scenario, setScenario] = useState("base");
+  const [year, setYear] = useState(2026);
+
+  // Link to Segment Simulation: when on, 2026 channel base comes from the saved Segment Sim snapshot
+  const segBase = segmentToCatBase();
+  const [linkSegment, setLinkSegment] = useState(!!segBase);
+
+  // active EV categories: default plan base, or Segment-linked base when toggle on
+  const EV_CATS = (linkSegment && segBase)
+    ? EV_CATEGORIES.map((c) => ({ ...c, base: Math.round(segBase[c.key] || 0) }))
+    : EV_CATEGORIES;
+
+  // EV category multiplier overrides (per category, % of BP target)
+  const [catMult, setCatMult] = useState(() =>
+    Object.fromEntries(EV_CATEGORIES.map((c) => [c.key, 100]))
+  );
+  // STB unit override (% of scenario default)
+  const [stbAdj, setStbAdj] = useState(100);
+  // Cost reduction lever (£ saved off fixed cost), applied from 2027
+  const [savings, setSavings] = useState({ 2026: 0, 2027: 687000, 2028: 687000 });
+  const [btKeep2028, setBtKeep2028] = useState(false);
+
+  const setCat = (k, v) => setCatMult((p) => ({ ...p, [k]: v }));
+
+  // ---- compute one year/scenario ----
+  const compute = (sc, yr, useOverrides) => {
+    const mult = SCENARIO_MULT[sc][yr];
+    // When Segment-linked, the 2026 base IS the actual 2026 quantity (scenario already baked in),
+    // so we do NOT re-apply the 2026 scenario multiplier. 2027/2028 still grow from it via their multipliers.
+    const linked = linkSegment && segBase;
+    let evUnits = 0;
+    const catBreak = EV_CATS.map((c) => {
+      const ov = useOverrides ? catMult[c.key] / 100 : 1;
+      let u;
+      if (linked && yr === 2026) {
+        u = c.base * ov;                       // Segment value used directly as 2026 base
+      } else if (linked) {
+        // grow the linked 2026 base into 2027/2028 by the ratio of scenario multipliers
+        const growth = mult / SCENARIO_MULT[sc][2026];
+        u = c.base * growth * ov;
+      } else {
+        u = c.base * mult * ov;                // original BP-plan behaviour
+      }
+      evUnits += u;
+      return { ...c, units: u, rev: u * evBlended() };
+    });
+    const evRev = evUnits * evBlended();
+    // STB
+    const stbBase = STB_UNITS[sc][yr];
+    const stbU = stbBase * (useOverrides ? stbAdj / 100 : 1);
+    const stbRev = stbU * PRICE.stb_fhr;
+    // BT
+    let btRev = BT_REV[yr];
+    if (yr === 2028 && btKeep2028) btRev = 700000;
+    // GP
+    const gp = evRev * GM.ev + stbRev * GM.stb + btRev * GM.bt;
+    const totRev = evRev + stbRev + btRev;
+    const fixed = BASE_FIXED - (useOverrides ? savings[yr] : 0);
+    const net = gp - fixed;
+    return { evUnits, evRev, catBreak, stbU, stbRev, btRev, gp, totRev, fixed, net };
+  };
+
+  const cur = useMemo(() => compute(scenario, year, true), [scenario, year, catMult, stbAdj, savings, btKeep2028, linkSegment]);
+
+  // 3-year x 3-scenario grid (with overrides applied to chosen scenario only? -> apply globally for comparison)
+  const grid = useMemo(() => {
+    const g = {};
+    SCEN.forEach((s) => {
+      g[s.key] = YEARS.map((y) => compute(s.key, y, s.key === scenario));
+    });
+    return g;
+  }, [scenario, catMult, stbAdj, savings, btKeep2028, linkSegment]);
+
+  const maxAbs = Math.max(
+    ...SCEN.flatMap((s) => grid[s.key].map((d) => Math.abs(d.net))),
+    1
+  );
+
+  // ---- Excel export with current setup ----
+  const exportExcel = async () => {
+    const r0 = (n) => Math.round(n);
+    const hasStyle = typeof window !== "undefined" && window.ExcelJS;
+
+    // ---------- assemble data as before (kept identical) ----------
+    const sumRows = [
+      ["HUK 3-Year P&L Simulation — Export"],
+      [`Setup note: slider adjustments applied to the '${SCEN.find((s) => s.key === scenario).label}' scenario`],
+      [],
+      ["Net P/L (GBP)", ...YEARS],
+      ...SCEN.map((s) => [s.label, ...grid[s.key].map((d) => r0(d.net))]),
+      [],
+      ["Net P/L (KRW)", ...YEARS],
+      ...SCEN.map((s) => [s.label, ...grid[s.key].map((d) => r0(d.net * getFX()))]),
+      [],
+      ["Total Revenue (GBP)", ...YEARS],
+      ...SCEN.map((s) => [s.label, ...grid[s.key].map((d) => r0(d.totRev))]),
+      [],
+      ["Gross Profit (GBP)", ...YEARS],
+      ...SCEN.map((s) => [s.label, ...grid[s.key].map((d) => r0(d.gp))]),
+      [],
+      ["Fixed Cost (GBP)", ...YEARS],
+      ...SCEN.map((s) => [s.label, ...grid[s.key].map((d) => r0(d.fixed))]),
+    ];
+
+    const scenarioSheets = SCEN.map((s) => {
+      const data = YEARS.map((y) => compute(s.key, y, s.key === scenario));
+      const rows = [
+        [`${s.label} Scenario — 3-Year Detail`],
+        [],
+        ["Revenue (GBP)", ...YEARS],
+        ["BT Operator", ...data.map((d) => r0(d.btRev))],
+        ["STB (FHR-6000T)", ...data.map((d) => r0(d.stbRev))],
+        ["EV Sales", ...data.map((d) => r0(d.evRev))],
+        ["Total Revenue", ...data.map((d) => r0(d.totRev))],
+        [],
+        ["Gross Profit (GBP)", ...YEARS],
+        ["BT (100%)", ...data.map((d) => r0(d.btRev * GM.bt))],
+        ["STB (20%)", ...data.map((d) => r0(d.stbRev * GM.stb))],
+        ["EV (20%)", ...data.map((d) => r0(d.evRev * GM.ev))],
+        ["Total GP", ...data.map((d) => r0(d.gp))],
+        [],
+        ["Fixed Cost", ...data.map((d) => r0(d.fixed))],
+        ["NET P/L (GBP)", ...data.map((d) => r0(d.net))],
+        ["NET P/L (KRW)", ...data.map((d) => r0(d.net * getFX()))],
+        [],
+        ["Units", ...YEARS],
+        ["STB units", ...data.map((d) => r0(d.stbU))],
+        ["EV units (total)", ...data.map((d) => r0(d.evUnits))],
+        [],
+        ["EV units by category", ...YEARS],
+        ...EV_CATEGORIES.map((c, i) => [c.label, ...data.map((d) => r0(d.catBreak[i].units))]),
+        [],
+        ["EV revenue by category (GBP)", ...YEARS],
+        ...EV_CATEGORIES.map((c, i) => [c.label, ...data.map((d) => r0(d.catBreak[i].rev))]),
+      ];
+      return { label: s.label, rows };
+    });
+
+    const aRows = [
+      ["Assumptions & Settings"],
+      [],
+      ["Pricing (GBP)", ""],
+      ["EV Socket", PRICE.ev_socket],
+      ["EV 5M", PRICE.ev_5m],
+      ["EV 7.5M", PRICE.ev_75m],
+      ["EV 22kW (MX Pro)", PRICE.ev_22kw],
+      ["EV blended (50/25/25)", +evBlended().toFixed(2)],
+      ["STB FHR-6000T", PRICE.stb_fhr],
+      [],
+      ["Gross Margin", ""],
+      ["EV / STB / BT", `${GM.ev * 100}% / ${GM.stb * 100}% / ${GM.bt * 100}%`],
+      ["FX (KRW/GBP)", getFX()],
+      ["Base Fixed Cost", BASE_FIXED],
+      [],
+      ["Cost reduction applied (GBP)", ""],
+      ...YEARS.map((y) => [`${y} savings`, savings[y]]),
+      [],
+      ["Current EV category overrides (% of BP target)", ""],
+      ...EV_CATEGORIES.map((c) => [c.label, catMult[c.key] + "%"]),
+      ["STB adjustment", stbAdj + "%"],
+      ["BT kept in 2028", btKeep2028 ? "Yes" : "No"],
+      [],
+      ["EV category base (2026, units)" + (linkSegment && segBase ? " — from Segment Sim" : " — BP plan"), ""],
+      ...EV_CATS.map((c) => [c.label, c.base]),
+    ];
+
+    // ---------- fallback: plain SheetJS if ExcelJS not present ----------
+    if (!hasStyle) {
+      const wb = XLSX.utils.book_new();
+      const w1 = XLSX.utils.aoa_to_sheet(sumRows); w1["!cols"] = [{ wch: 22 }, { wch: 14 }, { wch: 14 }, { wch: 14 }];
+      XLSX.utils.book_append_sheet(wb, w1, "Summary");
+      scenarioSheets.forEach((sh) => { const w = XLSX.utils.aoa_to_sheet(sh.rows); w["!cols"] = [{ wch: 26 }, { wch: 14 }, { wch: 14 }, { wch: 14 }]; XLSX.utils.book_append_sheet(wb, w, sh.label); });
+      const w5 = XLSX.utils.aoa_to_sheet(aRows); w5["!cols"] = [{ wch: 38 }, { wch: 16 }];
+      XLSX.utils.book_append_sheet(wb, w5, "Assumptions");
+      XLSX.writeFile(wb, "HUK_3Year_PL_Simulation.xlsx");
+      return;
+    }
+
+    // ---------- styled workbook (ExcelJS) ----------
+    const INDIGO = "FF001C3D", AZURE = "FF00B1A1", FOREST = "FF163E35", LIGHT = "FFF7FAFB", LINE = "FFDDE3EA", REDc = "FFD64545";
+    const wb = new window.ExcelJS.Workbook();
+    wb.creator = "HUMAX UK";
+
+    const thin = { style: "thin", color: { argb: LINE } };
+    const border = { top: thin, left: thin, bottom: thin, right: thin };
+
+    // detect a "section header" row: text in col0, rest empty OR equals YEARS labels
+    const isYearHeader = (row) => row.length > 1 && YEARS.every((y, i) => String(row[i + 1]) === String(y));
+    const numFmt = '#,##0';
+
+    const buildSheet = (name, rows, opts = {}) => {
+      const ws = wb.addWorksheet(name, { views: [{ showGridLines: false }] });
+      const ncol = Math.max(...rows.map((r) => r.length), 2);
+      ws.columns = [{ width: opts.firstWide || 30 }, ...Array(ncol - 1).fill({ width: 16 })];
+
+      let netBlock = null; // 'gbp' | 'krw' | null — color following data rows by sign
+
+      rows.forEach((rowArr, idx) => {
+        const r = ws.addRow(rowArr);
+        const first = String(rowArr[0] || "");
+        const isTitle = idx === 0;
+        const headNetGBP = first === "Net P/L (GBP)";
+        const headNetKRW = first === "Net P/L (KRW)";
+        const lineNetGBP = /^NET P\/L \(GBP\)/.test(first);
+        const lineNetKRW = /^NET P\/L \(KRW\)/.test(first);
+        const isTotalLine = /^(Total Revenue|Total GP)$/.test(first);
+        const yearHead = isYearHeader(rowArr);
+        const subLabel = rowArr.length === 2 && rowArr[1] === "" && first;
+
+        // update netBlock state based on this row
+        if (headNetGBP) netBlock = "gbp";
+        else if (headNetKRW) netBlock = "krw";
+        else if (yearHead || subLabel || first === "" || /\(GBP\)|Units|Cost/.test(first)) {
+          if (!lineNetGBP && !lineNetKRW) netBlock = null;
+        }
+
+        r.eachCell({ includeEmpty: false }, (cell, col) => {
+          cell.font = { name: "Calibri", size: 10, color: { argb: INDIGO } };
+          cell.border = border;
+          if (typeof cell.value === "number") { cell.numFmt = numFmt; cell.alignment = { horizontal: "right" }; }
+          else cell.alignment = { horizontal: col === 1 ? "left" : "right", vertical: "middle" };
+        });
+
+        if (isTitle) {
+          ws.mergeCells(idx + 1, 1, idx + 1, ncol);
+          const c = r.getCell(1);
+          c.value = first;
+          c.font = { name: "Calibri", size: 14, bold: true, color: { argb: "FFFFFFFF" } };
+          c.fill = { type: "pattern", pattern: "solid", fgColor: { argb: INDIGO } };
+          c.alignment = { horizontal: "left", vertical: "middle" };
+          r.height = 26;
+          return;
+        }
+        if (yearHead) {
+          r.eachCell((cell) => {
+            cell.font = { name: "Calibri", size: 10.5, bold: true, color: { argb: "FFFFFFFF" } };
+            cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: FOREST } };
+            cell.alignment = { horizontal: cell.col === 1 ? "left" : "right", vertical: "middle" };
+          });
+          r.height = 20;
+          return;
+        }
+        if (subLabel) {
+          const c = r.getCell(1);
+          c.font = { name: "Calibri", size: 10.5, bold: true, color: { argb: AZURE } };
+          c.fill = { type: "pattern", pattern: "solid", fgColor: { argb: LIGHT } };
+          return;
+        }
+        // inline NET P/L line (per-scenario sheets) — color values by sign
+        if (lineNetGBP || lineNetKRW) {
+          r.eachCell((cell, col) => {
+            cell.font = { name: "Calibri", size: 10, bold: true, color: { argb: col === 1 ? INDIGO : (Number(cell.value) >= 0 ? AZURE : REDc) } };
+          });
+          return;
+        }
+        // scenario data rows inside a Net P/L block (Summary sheet) — color by sign
+        if (netBlock && col1IsScenario(first)) {
+          r.eachCell((cell, col) => {
+            cell.font = { name: "Calibri", size: 10, bold: true, color: { argb: col === 1 ? INDIGO : (Number(cell.value) >= 0 ? AZURE : REDc) } };
+          });
+          return;
+        }
+        if (isTotalLine) {
+          r.eachCell((cell) => { cell.font = { name: "Calibri", size: 10, bold: true, color: { argb: INDIGO } }; });
+        }
+      });
+      ws.views = [{ state: "frozen", ySplit: 1, showGridLines: false }];
+      return ws;
+    };
+
+    const col1IsScenario = (label) => SCEN.some((s) => s.label === label);
+
+    buildSheet("Summary", sumRows, { firstWide: 24 });
+    scenarioSheets.forEach((sh) => buildSheet(sh.label, sh.rows, { firstWide: 28 }));
+    buildSheet("Assumptions", aRows, { firstWide: 42 });
+
+    const buf = await wb.xlsx.writeBuffer();
+    const blob = new Blob([buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "HUK_3Year_PL_Simulation.xlsx";
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <>
+      <header style={S.header}>
+        <div>
+          <div style={S.kicker}>HUMAX UK · FINANCIAL SCENARIO LAB</div>
+          <h1 style={S.h1}>3-Year P&L Simulator</h1>
+          <div style={S.sub}>
+            EV (category-level) · STB FHR-6000T · BT maintenance — adjust revenue & cost-reduction scenarios
+          </div>
+        </div>
+        <div style={S.headerRight}>
+          <button onClick={exportExcel} style={S.dlBtn}>
+            <span style={{ fontSize: 15 }}>↓</span> Download Excel
+          </button>
+          <div style={S.netBadge}>
+            <div style={S.netBadgeLabel}>{year} · {SCEN.find((s) => s.key === scenario).label} · Net P/L</div>
+            <div style={{ ...S.netBadgeVal, color: cur.net >= 0 ? "#00B1A1" : "#d64545" }}>
+              {fmtGBP(cur.net)}
+            </div>
+            <div style={S.netBadgeKrw}>{fmtKRW(cur.net)}</div>
+          </div>
+        </div>
+      </header>
+
+      {/* selectors */}
+      <div style={S.selectorRow}>
+        <div style={S.segGroup}>
+          {SCEN.map((s) => (
+            <button
+              key={s.key}
+              onClick={() => setScenario(s.key)}
+              style={{
+                ...S.seg,
+                ...(scenario === s.key ? { background: s.color, color: "#fff", borderColor: s.color } : {}),
+              }}
+            >
+              {s.label}
+            </button>
+          ))}
+        </div>
+        <div style={S.segGroup}>
+          {YEARS.map((y) => (
+            <button
+              key={y}
+              onClick={() => setYear(y)}
+              style={{ ...S.seg, ...(year === y ? S.segActiveDark : {}) }}
+            >
+              {y}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div style={S.grid2}>
+        {/* LEFT: revenue controls */}
+        <section style={S.panel}>
+          <h2 style={S.h2}>Revenue Scenario Controls</h2>
+          <div style={S.panelNote}>
+            Based on <b>{SCEN.find((s) => s.key === scenario).label} · {year}</b>. Sliders adjust achievement (%) vs BP target.
+          </div>
+
+          <div style={S.blockLabel}>EV — by Category (blended £{evBlended().toFixed(0)}/unit)</div>
+          <div style={SIMLINK.bar}>
+            <div>
+              <div style={SIMLINK.title}>2026 Base ← Segment Simulation</div>
+              <div style={SIMLINK.sub}>
+                {segBase
+                  ? (linkSegment
+                      ? `Linked · 2026 base = ${Math.round(Object.values(segBase).reduce((a, b) => a + b, 0)).toLocaleString()} units from Segment Sim`
+                      : "Using BP plan base. Toggle on to use Segment Sim values.")
+                  : "No saved Segment Sim found — open Segment Simulation, set values, and click Save."}
+              </div>
+            </div>
+            <button
+              onClick={() => setLinkSegment((v) => !v)}
+              disabled={!segBase}
+              style={{ ...SIMLINK.toggle, ...(linkSegment ? SIMLINK.toggleOn : {}), ...(!segBase ? SIMLINK.toggleDisabled : {}) }}>
+              {linkSegment ? "Linked" : "Link"}
+            </button>
+          </div>
+          {cur.catBreak.map((c) => (
+            <div key={c.key} style={S.sliderRow}>
+              <div style={S.sliderHead}>
+                <span style={S.sliderName}>{c.label}</span>
+                <span style={S.sliderVal}>
+                  {Math.round(c.units).toLocaleString()} units · {fmtGBP(c.rev)}
+                </span>
+              </div>
+              <input
+                type="range" min="0" max="200" value={catMult[c.key]}
+                onChange={(e) => setCat(c.key, +e.target.value)}
+                style={S.range}
+              />
+              <div style={S.sliderSub}>{linkSegment && segBase ? `Seg base ${c.base.toLocaleString()}` : c.note} · {catMult[c.key]}%</div>
+            </div>
+          ))}
+          <div style={S.catTotal}>
+            <span style={S.catTotalLabel}>EV Total</span>
+            <span style={S.catTotalVal}>
+              {Math.round(cur.evUnits).toLocaleString()} units · {fmtGBP(cur.evRev)}
+              <span style={S.catTotalGp}> (GP {fmtGBP(cur.evRev * GM.ev)})</span>
+            </span>
+          </div>
+
+          <div style={{ ...S.blockLabel, marginTop: 18 }}>STB — FHR-6000T (£{PRICE.stb_fhr}/unit)</div>
+          <div style={S.sliderRow}>
+            <div style={S.sliderHead}>
+              <span style={S.sliderName}>FHR-6000T</span>
+              <span style={S.sliderVal}>{Math.round(cur.stbU).toLocaleString()} units · {fmtGBP(cur.stbRev)}</span>
+            </div>
+            <input type="range" min="0" max="150" value={stbAdj}
+              onChange={(e) => setStbAdj(+e.target.value)} style={S.range} />
+            <div style={S.sliderSub}>{stbAdj}% of scenario default</div>
+          </div>
+
+          <div style={{ ...S.blockLabel, marginTop: 18 }}>BT Maintenance</div>
+          <div style={S.btRow}>
+            <span style={S.sliderName}>{cur.btRev > 0 ? fmtGBP(cur.btRev) : "Removed (£0)"}</span>
+            {year === 2028 && (
+              <label style={S.checkLabel}>
+                <input type="checkbox" checked={btKeep2028}
+                  onChange={(e) => setBtKeep2028(e.target.checked)} />
+                Keep BT in 2028
+              </label>
+            )}
+            {year !== 2028 && <span style={S.sliderSub}>£700k through 2027 · removed in 2028</span>}
+          </div>
+        </section>
+
+        {/* RIGHT: cost + result */}
+        <section style={S.panel}>
+          <h2 style={S.h2}>Cost Reduction & P&L</h2>
+          <div style={S.blockLabel}>Fixed-Cost Savings (by year, £)</div>
+          {YEARS.map((y) => (
+            <div key={y} style={S.sliderRow}>
+              <div style={S.sliderHead}>
+                <span style={S.sliderName}>{y} savings</span>
+                <span style={S.sliderVal}>{fmtGBP(savings[y])}</span>
+              </div>
+              <input type="range" min="0" max="1000000" step="1000" value={savings[y]}
+                onChange={(e) => setSavings((p) => ({ ...p, [y]: +e.target.value }))}
+                style={S.range} />
+              <div style={S.sliderSub}>
+                Adjusted fixed cost {fmtGBP(BASE_FIXED - savings[y])} · {((savings[y] / BASE_FIXED) * 100).toFixed(1)}% reduction
+              </div>
+            </div>
+          ))}
+
+          {/* P&L waterfall for current selection */}
+          <div style={S.plBox}>
+            <div style={S.plTitle}>{year} · {SCEN.find((s) => s.key === scenario).label} P&L</div>
+            {[
+              ["BT Operator", cur.btRev, cur.btRev * GM.bt],
+              ["STB (FHR-6000T)", cur.stbRev, cur.stbRev * GM.stb],
+              ["EV Sales", cur.evRev, cur.evRev * GM.ev],
+            ].map(([l, rev, gp]) => (
+              <div key={l} style={S.plRow}>
+                <span>{l}</span>
+                <span style={S.plRev}>{fmtM(rev)}</span>
+                <span style={S.plGp}>GP {fmtM(gp)}</span>
+              </div>
+            ))}
+            <div style={{ ...S.plRow, ...S.plSub }}>
+              <span>Total Revenue</span>
+              <span style={S.plRev}>{fmtM(cur.totRev)}</span>
+              <span style={S.plGp}>GP {fmtM(cur.gp)}</span>
+            </div>
+            <div style={{ ...S.plRow, color: "#777" }}>
+              <span>Fixed Cost</span>
+              <span></span>
+              <span style={S.plGp}>−{fmtM(cur.fixed)}</span>
+            </div>
+            <div style={{ ...S.plRow, ...S.plNet, color: cur.net >= 0 ? "#00B1A1" : "#d64545" }}>
+              <span>Net P/L</span>
+              <span></span>
+              <span style={S.plGp}>{fmtGBP(cur.net)}</span>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      {/* 3yr x 3scenario matrix */}
+      <section style={S.panel}>
+        <h2 style={S.h2}>3-Year × Scenario — Net P/L · Units · Revenue · Margin</h2>
+        <div style={S.matrix}>
+          <div style={S.matrixHead}></div>
+          {YEARS.map((y) => <div key={y} style={S.matrixHead}>{y}</div>)}
+          {SCEN.map((s) => (
+            <React.Fragment key={s.key}>
+              <div style={{ ...S.matrixRowLabel, color: s.color }}>{s.label}</div>
+              {grid[s.key].map((d, i) => (
+                <div key={i} style={S.matrixCell}>
+                  <div style={S.barWrap}>
+                    <div style={{
+                      ...S.bar,
+                      width: `${(Math.abs(d.net) / maxAbs) * 100}%`,
+                      background: d.net >= 0 ? "#00B1A1" : "#d64545",
+                      marginLeft: d.net >= 0 ? "50%" : `${50 - (Math.abs(d.net) / maxAbs) * 50}%`,
+                    }} />
+                    <div style={S.barAxis} />
+                  </div>
+                  <div style={{ ...S.matrixVal, color: d.net >= 0 ? "#00B1A1" : "#d64545" }}>
+                    {fmtGBP(d.net)}
+                  </div>
+                  <div style={S.matrixMeta}>
+                    <div style={S.metaLine}><span>EV units</span><span>{r0k(d.evUnits)}</span></div>
+                    <div style={S.metaLine}><span>STB units</span><span>{r0k(d.stbU)}</span></div>
+                    <div style={S.metaLine}><span>Revenue</span><span>{fmtM(d.totRev)}</span></div>
+                    <div style={S.metaLine}><span>Margin</span><span>{fmtM(d.gp)}</span></div>
+                  </div>
+                </div>
+              ))}
+            </React.Fragment>
+          ))}
+        </div>
+        <div style={S.footNote}>
+          Note: slider adjustments apply only to the selected <b>{SCEN.find((s) => s.key === scenario).label}</b> scenario.
+          The other two scenarios use default assumptions. Cost reduction applies equally to all three.
+          EV blended £{evBlended().toFixed(0)} · STB £{PRICE.stb_fhr} · BT £700k through 2027 · FX {getFX()} KRW/£.
+        </div>
+      </section>
+    </>
+  );
+}
+
+// ============================================================
+//  HUMAX EV Charging — Design System
+//  Indigo #001C3D · Azure #00B1A1 · Sunshine #FDB515 · Forest #163E35
+//  Typeface: Poppins
+// ============================================================
+const HX = {
+  indigo: "#001C3D",
+  azure: "#00B1A1",
+  sunshine: "#00B1A1",
+  forest: "#163E35",
+  ink: "#0d1b2a",
+  paper: "#f5f7fa",
+  card: "#ffffff",
+  line: "#dde3ea",
+  muted: "#5b6b7d",
+};
+const ACCENT = HX.indigo;
+const POS = HX.azure;   // profit
+const NEG = "#d64545";  // loss
+
+const CSS = `
+  @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700;800&display=swap');
+  * { box-sizing: border-box; }
+  input[type=range]{ -webkit-appearance:none; appearance:none; height:5px; border-radius:5px; background:#d4dce5; outline:none; }
+  input[type=range]::-webkit-slider-thumb{ -webkit-appearance:none; width:18px; height:18px; border-radius:50%; background:${HX.azure}; cursor:pointer; border:3px solid ${HX.indigo}; box-shadow:0 1px 5px rgba(0,28,61,.3); }
+  input[type=range]::-moz-range-thumb{ width:18px; height:18px; border-radius:50%; background:${HX.azure}; cursor:pointer; border:3px solid ${HX.indigo}; }
+`;
+
+const S = {
+  page: { fontFamily: "'Poppins', sans-serif", background: HX.paper, minHeight: "100vh", padding: "28px 32px 60px", color: HX.ink },
+  header: { display: "flex", justifyContent: "space-between", alignItems: "flex-end", flexWrap: "wrap", gap: 20, background: HX.indigo, borderRadius: 16, padding: "26px 30px", marginBottom: 22, boxShadow: "0 8px 28px rgba(0,28,61,.18)" },
+  kicker: { fontFamily: "'Poppins', sans-serif", fontSize: 11, letterSpacing: 3, color: HX.sunshine, fontWeight: 600, textTransform: "uppercase" },
+  h1: { fontFamily: "'Poppins', sans-serif", fontSize: 34, fontWeight: 700, margin: "6px 0 6px", lineHeight: 1.05, color: "#fff", letterSpacing: -0.5 },
+  sub: { fontSize: 13, color: "#aebccd", fontWeight: 300 },
+  headerRight: { display: "flex", alignItems: "stretch", gap: 12 },
+  dlBtn: { fontFamily: "'Poppins', sans-serif", fontSize: 13, fontWeight: 600, padding: "0 20px", border: `2px solid ${HX.sunshine}`, borderRadius: 12, background: HX.sunshine, color: HX.indigo, cursor: "pointer", display: "flex", alignItems: "center", gap: 8, whiteSpace: "nowrap" },
+  netBadge: { textAlign: "right", background: "rgba(255,255,255,.08)", border: "1px solid rgba(255,255,255,.18)", borderRadius: 12, padding: "12px 20px", backdropFilter: "blur(4px)" },
+  netBadgeLabel: { fontSize: 10.5, color: "#aebccd", fontWeight: 400, letterSpacing: 0.5, textTransform: "uppercase" },
+  netBadgeVal: { fontFamily: "'Poppins', sans-serif", fontSize: 28, fontWeight: 700, lineHeight: 1.15 },
+  netBadgeKrw: { fontSize: 11.5, color: "#8da0b5", fontWeight: 300 },
+  selectorRow: { display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 20 },
+  segGroup: { display: "flex", gap: 4, background: "#fff", padding: 4, borderRadius: 12, border: `1px solid ${HX.line}`, boxShadow: "0 1px 6px rgba(0,28,61,.05)" },
+  seg: { fontFamily: "'Poppins', sans-serif", fontSize: 13, fontWeight: 500, padding: "7px 18px", border: "1px solid transparent", borderRadius: 8, background: "transparent", cursor: "pointer", color: HX.muted },
+  segActiveDark: { background: HX.indigo, color: "#fff", borderColor: HX.indigo },
+  grid2: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20, marginBottom: 20 },
+  panel: { background: HX.card, border: `1px solid ${HX.line}`, borderRadius: 16, padding: "22px 24px", boxShadow: "0 4px 18px rgba(0,28,61,.05)" },
+  h2: { fontFamily: "'Poppins', sans-serif", fontSize: 19, fontWeight: 600, margin: "0 0 6px", color: HX.indigo },
+  panelNote: { fontSize: 12.5, color: HX.muted, marginBottom: 16, fontWeight: 300 },
+  blockLabel: { fontFamily: "'Poppins', sans-serif", fontSize: 11, letterSpacing: 1.5, color: HX.azure, fontWeight: 600, textTransform: "uppercase", marginBottom: 12, borderBottom: `2px solid #eef2f6`, paddingBottom: 6 },
+  sliderRow: { marginBottom: 14 },
+  sliderHead: { display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 5 },
+  sliderName: { fontSize: 13.5, fontWeight: 600, color: HX.ink },
+  sliderVal: { fontFamily: "'Poppins', sans-serif", fontSize: 12.5, color: HX.indigo, fontWeight: 600 },
+  range: { width: "100%" },
+  sliderSub: { fontSize: 11, color: "#8a98a8", marginTop: 3, fontWeight: 300 },
+  catTotal: { display: "flex", justifyContent: "space-between", alignItems: "baseline", marginTop: 12, padding: "12px 16px", background: `linear-gradient(135deg, ${HX.indigo}, ${HX.forest})`, borderRadius: 12, color: "#fff" },
+  catTotalLabel: { fontFamily: "'Poppins', sans-serif", fontSize: 12, letterSpacing: 1.5, fontWeight: 600, color: HX.sunshine, textTransform: "uppercase" },
+  catTotalVal: { fontFamily: "'Poppins', sans-serif", fontSize: 14.5, fontWeight: 700 },
+  catTotalGp: { fontWeight: 300, opacity: 0.85, fontSize: 12.5 },
+  btRow: { display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" },
+  checkLabel: { fontSize: 12.5, display: "flex", alignItems: "center", gap: 6, cursor: "pointer", color: HX.ink, fontWeight: 500 },
+  plBox: { marginTop: 18, background: "#f7fafb", border: `1px solid ${HX.line}`, borderRadius: 12, padding: "16px 18px" },
+  plTitle: { fontFamily: "'Poppins', sans-serif", fontSize: 11, letterSpacing: 1.5, color: HX.azure, fontWeight: 600, marginBottom: 10, textTransform: "uppercase" },
+  plRow: { display: "grid", gridTemplateColumns: "1.4fr 1fr 1fr", fontSize: 13, padding: "5px 0", alignItems: "center" },
+  plRev: { textAlign: "right", fontFamily: "'Poppins', sans-serif", color: HX.muted, fontWeight: 400 },
+  plGp: { textAlign: "right", fontFamily: "'Poppins', sans-serif", fontWeight: 600 },
+  plSub: { borderTop: `1px solid ${HX.line}`, marginTop: 4, paddingTop: 8, fontWeight: 600 },
+  plNet: { borderTop: `2px solid ${HX.indigo}`, marginTop: 4, paddingTop: 8, fontFamily: "'Poppins', sans-serif", fontSize: 16, fontWeight: 700 },
+  matrix: { display: "grid", gridTemplateColumns: "80px 1fr 1fr 1fr", gap: 10, alignItems: "stretch" },
+  matrixHead: { fontFamily: "'Poppins', sans-serif", fontSize: 12, color: HX.muted, textAlign: "center", fontWeight: 600, alignSelf: "center" },
+  matrixRowLabel: { fontFamily: "'Poppins', sans-serif", fontSize: 15, fontWeight: 700, alignSelf: "center" },
+  matrixCell: { background: "#f7fafb", border: `1px solid ${HX.line}`, borderRadius: 10, padding: "10px 12px" },
+  barWrap: { position: "relative", height: 14, marginBottom: 6 },
+  bar: { position: "absolute", top: 3, height: 8, borderRadius: 4, minWidth: 2 },
+  barAxis: { position: "absolute", left: "50%", top: 0, bottom: 0, width: 1, background: "#c4d0dc" },
+  matrixVal: { fontFamily: "'Poppins', sans-serif", fontSize: 13.5, fontWeight: 700, textAlign: "center" },
+  matrixMeta: { marginTop: 8, paddingTop: 7, borderTop: `1px solid ${HX.line}` },
+  metaLine: { display: "flex", justifyContent: "space-between", fontFamily: "'Poppins', sans-serif", fontSize: 11, color: HX.muted, padding: "1.5px 0", fontWeight: 400 },
+  footNote: { fontSize: 11.5, color: "#8a98a8", marginTop: 16, lineHeight: 1.6, borderTop: `1px solid ${HX.line}`, paddingTop: 12, fontWeight: 300 },
+};
+
+// ============================================================
+//  CURRENT SALES DASHBOARD  (Actuals — WK23 2026)
+//  Source: Weekly Sales Report WK23 + Branch FCST Monthly Tracking
+// ============================================================
+const DASH = {
+  asOf: "WK23 · June 2026",
+  // EV / STB / BT YTD actuals (GBP, units)
+  ev: { ytdQty: 286, ytdRev: 103188, bpQty: 8388, bpRev: 3342382 },
+  stb: { ytdQty: 4495, ytdRev: 740072, bpQty: 20280, bpRev: 3102840 },
+  grand: { ytdRev: 843260, bpRev: 6445222 },
+  // EV monthly actual vs target (Jan–Dec)
+  months: ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],
+  evActual: [73, 17, 37, 78, 65, 16, null, null, null, null, null, null],
+  evTarget: [125, 180, 227, 115, 347, 461, 635, 782, 1015, 1439, 1692, 1778],
+  // EV category: YTD actual vs annual BP target (units) — consolidated channels
+  categories: [
+    { label: "Retail · EV Home", actual: 172, target: 4220 },
+    { label: "Retail · EV Commercial", actual: 0, target: 599 },
+    { label: "B2B · EV Home", actual: 96, target: 2900 },
+    { label: "B2B · EV Commercial", actual: 0, target: 805 },
+    { label: "eCommerce", actual: 18, target: 272 },
+  ],
+  // Product mix (retail sales units, from stock summary)
+  mix: [
+    { label: "MX7 Socket", units: 101 },
+    { label: "MX7 5M", units: 70 },
+    { label: "MX7 7.5M", units: 54 },
+    { label: "EQ7 4M", units: 22 },
+    { label: "EQ7 7M", units: 24 },
+    { label: "EQ Pro / MX Pro", units: 15 },
+  ],
+  // Stock on hand (key SKUs)
+  stock: [
+    { label: "MX7 Socket", qty: 343 },
+    { label: "MX7 5M", qty: 391 },
+    { label: "MX7 7.5M", qty: 415 },
+    { label: "EQ7 4M", qty: 40 },
+    { label: "EQ7 7M", qty: 55 },
+    { label: "MX Pro 22kW", qty: 25 },
+  ],
+};
+
+// Parse the published "Monthly Tracking" CSV into dashboard data.
+// Robust to the sheet's layout: category Target/Actual rows + Grand Total + branch detail.
+function parseMonthlyCSV(text) {
+  // simple CSV row splitter handling quoted commas
+  const rows = text.split(/\r?\n/).map((line) => {
+    const out = []; let cur = ""; let q = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') q = !q;
+      else if (ch === "," && !q) { out.push(cur); cur = ""; }
+      else cur += ch;
+    }
+    out.push(cur);
+    return out.map((s) => s.trim());
+  });
+  const num = (v) => { const n = parseFloat(String(v).replace(/[, ]/g, "")); return isNaN(n) ? 0 : n; };
+
+  // EV blended price & STB price come from CONFIG
+  const evP = evBlended();
+
+  // --- category section: EV Home / EV Commercial rows with Target/Actual per segment ---
+  // Track which EV segment block we're in, and which segment label each Target/Actual pair belongs to.
+  // Group into: Retail (Simon+Mudassar+Midland+North), B2B (B2B Home/Commercial), eCommerce — split Home vs Commercial.
+  const grp = {
+    retail_home: { actual: 0, target: 0 },
+    retail_comm: { actual: 0, target: 0 },
+    b2b_home: { actual: 0, target: 0 },
+    b2b_comm: { actual: 0, target: 0 },
+    ecom: { actual: 0, target: 0 },
+  };
+  let evSeg = ""; // "home" | "commercial"
+  let curLabel = "";
+  const classify = (label, seg) => {
+    const l = label.toLowerCase();
+    if (l.includes("ecommerce") || l.includes("e-commerce")) return "ecom";
+    if (l.includes("b2b")) return seg === "commercial" ? "b2b_comm" : "b2b_home";
+    // retail = Simon, Mudassar, Midland, North, Retailer/Wholesaler
+    return seg === "commercial" ? "retail_comm" : "retail_home";
+  };
+  rows.forEach((r) => {
+    const c0 = (r[0] || "").trim().toLowerCase();
+    if (c0.includes("ev home")) evSeg = "home";
+    else if (c0.includes("ev commercial")) evSeg = "commercial";
+    else if (c0.includes("grand total")) evSeg = "";
+    // category label sits in col1 on the Target row; col2 = Target/Actual/Ach %
+    const tag = (r[2] || "").toLowerCase();
+    const labelCell = (r[1] || "").trim();
+    if (labelCell) curLabel = labelCell;
+    if (!evSeg || !curLabel) return;
+    if (tag === "target" || tag === "actual") {
+      const monthly = r.slice(3, 15).map(num);
+      const tot = monthly.reduce((a, b) => a + b, 0);
+      const bucket = classify(curLabel, evSeg);
+      if (grp[bucket]) grp[bucket][tag === "target" ? "target" : "actual"] += tot;
+    }
+  });
+  const hasGrouped = Object.values(grp).some((g) => g.target > 0 || g.actual > 0);
+
+  // legacy branch-detail consolidation (kept for evMonthlyActual / evUnits / fallback) ---
+  const catActual = {};
+  let grandActualMonthly = new Array(12).fill(0);
+  rows.forEach((r) => {
+    const tag = (r[2] || "").toLowerCase();
+    const label = r[1] || "";
+    if (tag === "actual" && label && r.length >= 15) {
+      const monthly = r.slice(3, 15).map(num);
+      const tot = monthly.reduce((a, b) => a + b, 0);
+      if (label) catActual[label] = (catActual[label] || 0) + tot;
+    }
+    if ((r[0] || "").toLowerCase() === "grand total" && tag === "actual") {
+      grandActualMonthly = r.slice(3, 15).map(num);
+    }
+  });
+
+  const evMonthlyActual = grandActualMonthly.map((v) => (v > 0 ? v : null));
+  const evUnits = grandActualMonthly.reduce((a, b) => a + b, 0);
+
+  const groupedCats = [
+    { label: "Retail · EV Home", actual: grp.retail_home.actual, target: grp.retail_home.target },
+    { label: "Retail · EV Commercial", actual: grp.retail_comm.actual, target: grp.retail_comm.target },
+    { label: "B2B · EV Home", actual: grp.b2b_home.actual, target: grp.b2b_home.target },
+    { label: "B2B · EV Commercial", actual: grp.b2b_comm.actual, target: grp.b2b_comm.target },
+    { label: "eCommerce", actual: grp.ecom.actual, target: grp.ecom.target },
+  ];
+
+  return {
+    evMonthlyActual,
+    evUnits,
+    evRev: evUnits * evP,
+    categories: hasGrouped ? groupedCats : null,
+  };
+}
+
+// ============================================================
+//  PO ORDER-MASTER PARSER (Simon / Mudassar / B2B Sales tabs)
+//  Parses Confirmed PO rows → Wholesaler → Branch → month/week qty & revenue
+// ============================================================
+const PO_SKU_PRICE = { socket: 369, c5m: 379, c75m: 396, mx22: 579 };
+const PO_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+function splitCSVLine(line) {
+  const out = []; let cur = ""; let q = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') q = !q;
+    else if (ch === "," && !q) { out.push(cur); cur = ""; }
+    else cur += ch;
+  }
+  out.push(cur);
+  return out.map((s) => s.trim());
+}
+
+// Parse all order-master sections from the full published CSV text.
+// Auto-detects each section by its header row, handles Simon/Mudassar (19-col) and B2B (17-col) layouts.
+function parsePOOrders(text) {
+  const numv = (v) => { const n = parseFloat(String(v).replace(/[, ]/g, "")); return isNaN(n) ? 0 : n; };
+  const lines = text.split(/\r?\n/);
+  const rows = lines.map(splitCSVLine);
+
+  const recs = [];
+  let layout = null; // current column layout
+
+  rows.forEach((r) => {
+    const c0 = (r[0] || "").trim();
+    // detect header rows
+    if (c0 === "Status" && r.includes("Model")) {
+      const wholeIdx = r.findIndex((x) => /Wholesaler|Dist/i.test(x));
+      const custIdx = r.findIndex((x) => /Customer/i.test(x));
+      const branchIdx = r.findIndex((x) => /Branch/i.test(x));
+      const monthIdx = r.findIndex((x) => /Target Month/i.test(x));
+      const weekIdx = r.findIndex((x) => /Week/i.test(x));
+      const mx22Idx = r.findIndex((x) => /^MX22$/i.test(x));
+      const eqp7Idx = r.findIndex((x) => /EQ Pro 7/i.test(x));
+      const eqp22Idx = r.findIndex((x) => /EQ Pro 22/i.test(x));
+      layout = {
+        model: 1, socket: 2, c5m: 3, c75m: 4,
+        eqp7: eqp7Idx >= 0 ? eqp7Idx : 5,
+        eqp22: eqp22Idx >= 0 ? eqp22Idx : 6,
+        mx22: mx22Idx >= 0 ? mx22Idx : 7,
+        branch: branchIdx >= 0 ? branchIdx : 12,
+        whole: wholeIdx >= 0 ? wholeIdx : (custIdx >= 0 ? custIdx : 13),
+        month: monthIdx >= 0 ? monthIdx : 15,
+        week: weekIdx >= 0 ? weekIdx : 16,
+        custIdx,
+      };
+      return;
+    }
+    if (!layout) return;
+    if (c0 !== "Confirmed PO") return;
+
+    const model = (r[layout.model] || "").trim().toUpperCase();
+    const socket = numv(r[layout.socket]), c5 = numv(r[layout.c5m]), c75 = numv(r[layout.c75m]), mx22 = numv(r[layout.mx22]);
+    const eqp7 = numv(r[layout.eqp7]), eqp22 = numv(r[layout.eqp22]);
+    const qty = socket + c5 + c75 + mx22 + eqp7 + eqp22;
+    if (qty <= 0) return;
+
+    // SKU-level product mix attribution by Model + cable column
+    // MX7 → Socket / 5M / 7.5M ; EQ7 → EQ7 4M(socket col) / EQ7 7M(5m+7.5m) ; EQ Pro/MX22 → commercial
+    const isEQ7 = model.startsWith("EQ7");
+    const isEQPro = model.includes("EQ PRO") || model.includes("MX PRO") || model === "22KW";
+    const sku = {
+      mx7_socket: 0, mx7_5m: 0, mx7_75m: 0,
+      eq7_4m: 0, eq7_7m: 0, eqpro: 0,
+    };
+    if (isEQ7) {
+      // EQ7 uses the cable columns: treat socket col → 4M, 5m+7.5m → 7M
+      sku.eq7_4m += socket;
+      sku.eq7_7m += c5 + c75;
+    } else if (isEQPro) {
+      sku.eqpro += socket + c5 + c75 + eqp7 + eqp22 + mx22;
+    } else {
+      // MX7 (residential cable lengths)
+      sku.mx7_socket += socket;
+      sku.mx7_5m += c5;
+      sku.mx7_75m += c75;
+      sku.eqpro += eqp7 + eqp22 + mx22; // any commercial SKU on an MX7 row
+    }
+
+    let whole = (r[layout.whole] || "").trim();
+    let branch = (r[layout.branch] || "").trim();
+    if (!whole) whole = branch || "Other";
+    if (!branch) branch = whole;
+
+    const month = (r[layout.month] || "").trim();
+    const week = numv(r[layout.week]);
+    const rev = socket * PO_SKU_PRICE.socket + c5 * PO_SKU_PRICE.c5m + c75 * PO_SKU_PRICE.c75m + (mx22 + eqp22) * PO_SKU_PRICE.mx22 + eqp7 * PO_SKU_PRICE.c75m;
+    recs.push({ whole, branch, month, week, socket, c5, c75, mx22, qty, rev, sku });
+  });
+  return recs;
+}
+
+// Aggregate Confirmed-PO records into the 6 Product-Mix buckets
+function poProductMix(recs) {
+  const t = { mx7_socket: 0, mx7_5m: 0, mx7_75m: 0, eq7_4m: 0, eq7_7m: 0, eqpro: 0 };
+  recs.forEach((r) => { if (r.sku) Object.keys(t).forEach((k) => (t[k] += r.sku[k] || 0)); });
+  return [
+    { label: "MX7 Socket", units: t.mx7_socket },
+    { label: "MX7 5M", units: t.mx7_5m },
+    { label: "MX7 7.5M", units: t.mx7_75m },
+    { label: "EQ7 4M", units: t.eq7_4m },
+    { label: "EQ7 7M", units: t.eq7_7m },
+    { label: "EQ Pro / MX Pro", units: t.eqpro },
+  ];
+}
+
+// Aggregate records into Wholesaler → Branch → per-month/week structure
+function aggregatePO(recs, mode /* 'month' | 'week' */) {
+  const cols = mode === "week"
+    ? Array.from({ length: 53 }, (_, i) => i + 1)   // WK1..53
+    : PO_MONTHS;
+  const keyOf = (rec) => mode === "week" ? rec.week : rec.month;
+
+  const wholeMap = {};
+  recs.forEach((rec) => {
+    const wKey = rec.whole;
+    if (!wholeMap[wKey]) wholeMap[wKey] = { name: wKey, branches: {}, qty: 0, rev: 0, byCol: {} };
+    const w = wholeMap[wKey];
+    if (!w.branches[rec.branch]) w.branches[rec.branch] = { name: rec.branch, qty: 0, rev: 0, byCol: {} };
+    const b = w.branches[rec.branch];
+    const k = keyOf(rec);
+    b.byCol[k] = (b.byCol[k] || 0) + rec.qty;
+    w.byCol[k] = (w.byCol[k] || 0) + rec.qty;
+    b.qty += rec.qty; b.rev += rec.rev;
+    w.qty += rec.qty; w.rev += rec.rev;
+  });
+
+  const wholesalers = Object.values(wholeMap)
+    .map((w) => ({ ...w, branches: Object.values(w.branches).sort((a, b) => b.qty - a.qty) }))
+    .sort((a, b) => b.qty - a.qty);
+
+  // active columns only (drop all-zero months/weeks)
+  const activeCols = cols.filter((c) => wholesalers.some((w) => (w.byCol[c] || 0) > 0));
+  const totals = { byCol: {}, qty: 0, rev: 0 };
+  wholesalers.forEach((w) => {
+    activeCols.forEach((c) => (totals.byCol[c] = (totals.byCol[c] || 0) + (w.byCol[c] || 0)));
+    totals.qty += w.qty; totals.rev += w.rev;
+  });
+  return { wholesalers, activeCols, totals };
+}
+
+// ============================================================
+//  LIVE DATA STORE (shared between Settings inputs and Dashboard)
+//  Settings holds the CSV link inputs; Dashboard renders the data.
+// ============================================================
+const LIVE = {
+  urls: { monthly: "", kpi: "", simon: "", mudassar: "", b2b: "" },
+  data: null,      // parsed Monthly Tracking (KPIs / charts)
+  cats: null,      // parsed channel achievement categories (from KPI link)
+  poRecs: null,    // combined Confirmed PO records
+  status: "",
+};
+
+async function loadLiveData(onDone) {
+  const fetchText = async (url) => {
+    if (!url || !url.trim()) return null;
+    const res = await fetch(url.trim());
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return await res.text();
+  };
+  const u = LIVE.urls;
+  const anyUrl = u.monthly || u.kpi || u.simon || u.mudassar || u.b2b;
+  if (!anyUrl) { LIVE.status = "Enter at least one published CSV link in Settings."; onDone && onDone(); return; }
+  LIVE.status = "Loading…"; onDone && onDone();
+  try {
+    let monthlyOk = false;
+    if (u.monthly) {
+      const t = await fetchText(u.monthly);
+      if (t) { LIVE.data = parseMonthlyCSV(t); monthlyOk = true; }
+    }
+    // KPI link → channel achievement (Retail / B2B / eCommerce). Falls back to monthly tab.
+    let kpiOk = false;
+    if (u.kpi) {
+      const t = await fetchText(u.kpi);
+      if (t) {
+        const parsed = parseMonthlyCSV(t);
+        if (parsed.categories) { LIVE.cats = parsed.categories; kpiOk = true; }
+        if (!monthlyOk && parsed) { LIVE.data = parsed; }
+      }
+    } else if (monthlyOk && LIVE.data && LIVE.data.categories) {
+      LIVE.cats = LIVE.data.categories; // monthly tab also carries the KPI section
+    }
+    const poTexts = [];
+    for (const k of ["simon", "mudassar", "b2b"]) {
+      try { const t = await fetchText(u[k]); if (t) poTexts.push(t); } catch (e) {}
+    }
+    let allRecs = [];
+    poTexts.forEach((t) => { try { allRecs = allRecs.concat(parsePOOrders(t)); } catch (e) {} });
+    if (allRecs.length === 0 && u.monthly) {
+      try { const t = await fetchText(u.monthly); if (t) allRecs = parsePOOrders(t); } catch (e) {}
+    }
+    LIVE.poRecs = allRecs.length ? allRecs : null;
+    const parts = [];
+    if (monthlyOk) parts.push("KPIs");
+    if (kpiOk) parts.push("Channels");
+    if (allRecs.length) parts.push(`${allRecs.length} PO rows`);
+    LIVE.status = (parts.length ? "Connected (" + parts.join(" · ") + ")" : "Connected") + " · " + new Date().toLocaleTimeString();
+  } catch (e) {
+    LIVE.status = "Could not load — check links are published CSV (…/pub?…output=csv).";
+  }
+  onDone && onDone();
+}
+
+function Dashboard() {
+  const [, force] = useState(0);
+  const [poMode, setPoMode] = useState("month"); // 'month' | 'week'
+  const [poExpanded, setPoExpanded] = useState({}); // wholesaler name -> bool
+
+  const live = LIVE.data;
+  const poRecs = LIVE.poRecs;
+
+  // merge live data over the static DASH defaults
+  const d = useMemo(() => {
+    const base = DASH;
+    const catsLive = LIVE.cats && LIVE.cats.some((c) => c.target > 0) ? LIVE.cats : null;
+    if (!live) return catsLive ? { ...base, categories: catsLive } : base;
+    return {
+      ...base,
+      ev: { ...base.ev, ytdQty: live.evUnits || base.ev.ytdQty, ytdRev: live.evRev || base.ev.ytdRev },
+      grand: { ...base.grand, ytdRev: (live.evRev || base.ev.ytdRev) + base.stb.ytdRev },
+      evActual: live.evMonthlyActual && live.evMonthlyActual.some((x) => x) ? live.evMonthlyActual : base.evActual,
+      categories: LIVE.cats && LIVE.cats.some((c) => c.target > 0) ? LIVE.cats
+        : (live.categories && live.categories.some((c) => c.target > 0) ? live.categories : base.categories),
+    };
+  }, [live]);
+
+  const pct = (a, b) => (b ? (a / b) * 100 : 0);
+  const evAch = pct(d.ev.ytdRev, d.ev.bpRev);
+  const stbAch = pct(d.stb.ytdRev, d.stb.bpRev);
+  const grandAch = pct(d.grand.ytdRev, d.grand.bpRev);
+  const maxCat = Math.max(...d.categories.map((c) => c.target));
+  const maxMonth = Math.max(...d.evTarget);
+  // Product mix: prefer live PO SKU breakdown; fall back to static DASH.mix
+  const mixData = useMemo(() => {
+    if (poRecs && poRecs.length) {
+      const pm = poProductMix(poRecs);
+      if (pm.some((m) => m.units > 0)) return pm;
+    }
+    return d.mix;
+  }, [poRecs, d.mix]);
+  const totalMix = mixData.reduce((s, m) => s + m.units, 0);
+  const fmtGBP0 = (n) => "£" + Math.round(n).toLocaleString();
+  const fmtKRW0 = (n) => "₩" + Math.round(n * getFX()).toLocaleString();
+
+  // PO aggregation (Wholesaler → Branch → month/week)
+  const poAgg = useMemo(() => (poRecs ? aggregatePO(poRecs, poMode) : null), [poRecs, poMode]);
+  const toggleWhole = (name) => setPoExpanded((p) => ({ ...p, [name]: !p[name] }));
+
+  const KPI = ({ label, value, sub, ach, accent }) => (
+    <div style={D.kpi}>
+      <div style={D.kpiLabel}>{label}</div>
+      <div style={{ ...D.kpiVal, color: accent || HX.indigo }}>{value}</div>
+      <div style={D.kpiSub}>{sub}</div>
+      {ach !== undefined && (
+        <div style={D.kpiBarWrap}>
+          <div style={{ ...D.kpiBar, width: `${Math.min(ach, 100)}%`, background: accent || HX.azure }} />
+          <span style={D.kpiAch}>{ach.toFixed(1)}% of BP</span>
+        </div>
+      )}
+    </div>
+  );
+
+  return (
+    <div>
+      <div style={DL.statusBar}>
+        <div style={DL.connInfo}>
+          <span style={DL.connDot(live || poRecs)} />
+          <span style={DL.connTitle}>Live Data</span>
+          <span style={DL.connStatus}>{LIVE.status || ((live || poRecs) ? "Connected" : "Not connected — showing default WK23 data. Add CSV links in ⚙ Settings.")}</span>
+        </div>
+        <button style={DL.connBtnGhost} onClick={() => loadLiveData(() => force((x) => x + 1))} title="Refresh from Google Sheet">↻ Refresh</button>
+      </div>
+      <div style={D.kpiRow}>
+        <KPI label="EV · YTD Units" value={d.ev.ytdQty.toLocaleString()} sub={`BP ${d.ev.bpQty.toLocaleString()} units`} ach={pct(d.ev.ytdQty, d.ev.bpQty)} accent={HX.azure} />
+        <KPI label="EV · YTD Revenue" value={fmtGBP0(d.ev.ytdRev)} sub={`BP ${fmtGBP0(d.ev.bpRev)}`} ach={evAch} accent={HX.azure} />
+        <KPI label="STB · YTD Units" value={d.stb.ytdQty.toLocaleString()} sub={`BP ${d.stb.bpQty.toLocaleString()} units`} ach={pct(d.stb.ytdQty, d.stb.bpQty)} accent={HX.forest} />
+        <KPI label="STB · YTD Revenue" value={fmtGBP0(d.stb.ytdRev)} sub={`BP ${fmtGBP0(d.stb.bpRev)}`} ach={stbAch} accent={HX.forest} />
+        <KPI label="Total · YTD Revenue" value={fmtGBP0(d.grand.ytdRev)} sub={fmtKRW0(d.grand.ytdRev) + ` · BP ${fmtGBP0(d.grand.bpRev)}`} ach={grandAch} accent={HX.indigo} />
+      </div>
+
+      <div style={D.grid2}>
+        {/* Monthly EV trend */}
+        <section style={S.panel}>
+          <h2 style={S.h2}>EV Monthly Actual vs Target (units)</h2>
+          <div style={D.chart}>
+            {d.months.map((m, i) => {
+              const t = d.evTarget[i];
+              const a = d.evActual[i];
+              return (
+                <div key={m} style={D.barCol}>
+                  <div style={D.barStack}>
+                    <div style={{ ...D.barTarget, height: `${(t / maxMonth) * 100}%` }} title={`Target ${t}`} />
+                    {a !== null && (
+                      <div style={{ ...D.barActual, height: `${(a / maxMonth) * 100}%` }} title={`Actual ${a}`} />
+                    )}
+                  </div>
+                  <div style={D.barLabel}>{m}</div>
+                </div>
+              );
+            })}
+          </div>
+          <div style={D.legend}>
+            <span><i style={{ ...D.dot, background: "#c4d0dc" }} /> Target</span>
+            <span><i style={{ ...D.dot, background: HX.azure }} /> Actual</span>
+          </div>
+        </section>
+
+        {/* Product mix donut-ish bars */}
+        <section style={S.panel}>
+          <h2 style={S.h2}>Product Mix ({poRecs && poRecs.length ? "Confirmed PO" : "default"} · {totalMix} units)</h2>
+          {mixData.map((m, i) => {
+            const p = (m.units / totalMix) * 100;
+            const cols = [HX.indigo, HX.azure, HX.forest, "#3a6ea5", "#5fa8a0", "#9bb0c2"];
+            return (
+              <div key={m.label} style={D.mixRow}>
+                <span style={D.mixLabel}>{m.label}</span>
+                <div style={D.mixTrack}>
+                  <div style={{ ...D.mixFill, width: `${p}%`, background: cols[i % cols.length] }} />
+                </div>
+                <span style={D.mixVal}>{m.units} · {p.toFixed(0)}%</span>
+              </div>
+            );
+          })}
+        </section>
+      </div>
+
+      {/* Category achievement */}
+      <section style={S.panel}>
+        <h2 style={S.h2}>EV BP Achievement by Channel (Retail / B2B / eCommerce · units)</h2>
+        <div style={D.catGrid}>
+          {d.categories.map((c) => {
+            const ach = pct(c.actual, c.target);
+            return (
+              <div key={c.label} style={D.catRow}>
+                <span style={D.catLabel}>{c.label}</span>
+                <div style={D.catTrack}>
+                  <div style={{ ...D.catTargetMark, width: `${(c.target / maxCat) * 100}%` }} />
+                  <div style={{ ...D.catActualBar, width: `${(c.actual / maxCat) * 100}%` }} />
+                </div>
+                <span style={D.catVal}>{c.actual}/{c.target.toLocaleString()} · {ach.toFixed(0)}%</span>
+              </div>
+            );
+          })}
+        </div>
+        <div style={D.legend}>
+          <span><i style={{ ...D.dot, background: "#e3e9ef" }} /> Annual Target</span>
+          <span><i style={{ ...D.dot, background: HX.azure }} /> YTD Actual</span>
+        </div>
+        <div style={S.footNote}>
+          Data as of {d.asOf}. Source — Weekly Sales Report WK23 · Branch FCST Monthly Tracking.
+          EV Socket £{PRICE.ev_socket} / 5M £{PRICE.ev_5m} / 7.5M £{PRICE.ev_75m} · STB FHR-6000T £{PRICE.stb_fhr} · FX {getFX()} KRW/£.
+        </div>
+      </section>
+
+      {/* Confirmed PO detail — Wholesaler → Branch */}
+      <section style={S.panel}>
+        <div style={PO.head}>
+          <div>
+            <h2 style={{ ...S.h2, margin: 0 }}>Sales by Channel</h2>
+            <div style={S.panelNote}>
+              {poAgg
+                ? `Confirmed PO only · ${poAgg.totals.qty.toLocaleString()} units · ${fmtGBP0(poAgg.totals.rev)} · click a wholesaler to expand branches`
+                : "Connect the published Google Sheet (Simon / Mudassar / B2B Order Master tabs) to populate this table."}
+            </div>
+          </div>
+          {poAgg && (
+            <div style={PO.toggle}>
+              <button onClick={() => setPoMode("month")} style={{ ...PO.tBtn, ...(poMode === "month" ? PO.tBtnOn : {}) }}>Monthly</button>
+              <button onClick={() => setPoMode("week")} style={{ ...PO.tBtn, ...(poMode === "week" ? PO.tBtnOn : {}) }}>Weekly</button>
+            </div>
+          )}
+        </div>
+
+        {poAgg && (
+          <div style={PO.scroll}>
+            <div style={{ ...PO.grid(poAgg.activeCols.length), ...PO.headRow }}>
+              <span style={PO.cWhole}>Main Channel</span>
+              <span style={PO.cBranch}>Branch / Showroom</span>
+              {poAgg.activeCols.map((c) => <span key={c} style={PO.cNum}>{poMode === "week" ? "W" + c : c}</span>)}
+              <span style={PO.cTot}>Qty</span>
+              <span style={PO.cRev}>Revenue</span>
+            </div>
+
+            {poAgg.wholesalers.map((w) => (
+              <React.Fragment key={w.name}>
+                {w.branches.map((b, bi) => (
+                  <div key={b.name + bi} style={{ ...PO.grid(poAgg.activeCols.length), ...PO.bRow, ...(bi === 0 ? PO.groupTop : {}) }}>
+                    <span style={PO.cWhole}>{bi === 0 ? w.name : ""}</span>
+                    <span style={PO.cBranch}>{b.name}</span>
+                    {poAgg.activeCols.map((c) => <span key={c} style={PO.cNum}>{b.byCol[c] || "·"}</span>)}
+                    <span style={PO.cTot}>{b.qty.toLocaleString()}</span>
+                    <span style={PO.cRev}>{fmtGBP0(b.rev)}</span>
+                  </div>
+                ))}
+                <div style={{ ...PO.grid(poAgg.activeCols.length), ...PO.subRow }}>
+                  <span style={PO.cWhole}></span>
+                  <span style={PO.cBranch}>{w.name} subtotal</span>
+                  {poAgg.activeCols.map((c) => <span key={c} style={PO.cNum}>{w.byCol[c] || "·"}</span>)}
+                  <span style={PO.cTot}>{w.qty.toLocaleString()}</span>
+                  <span style={PO.cRev}>{fmtGBP0(w.rev)}</span>
+                </div>
+              </React.Fragment>
+            ))}
+
+            <div style={{ ...PO.grid(poAgg.activeCols.length), ...PO.totRow }}>
+              <span style={PO.cWhole}>TOTAL</span>
+              <span style={PO.cBranch}></span>
+              {poAgg.activeCols.map((c) => <span key={c} style={PO.cNum}>{poAgg.totals.byCol[c] || "·"}</span>)}
+              <span style={PO.cTot}>{poAgg.totals.qty.toLocaleString()}</span>
+              <span style={PO.cRev}>{fmtGBP0(poAgg.totals.rev)}</span>
+            </div>
+          </div>
+        )}
+        <div style={S.footNote}>
+          Confirmed PO only. SKU pricing: Socket £{PO_SKU_PRICE.socket} · 5M £{PO_SKU_PRICE.c5m} · 7.5M £{PO_SKU_PRICE.c75m} · MX22 £{PO_SKU_PRICE.mx22}. Source — Simon / Mudassar / B2B Order Master.
+        </div>
+      </section>
+    </div>
+  );
+}
+
+// ============================================================
+//  SEGMENT SIMULATION (2026 only)
+//  Existing channel run-rate + add pipeline customers
+// ============================================================
+const SEG_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const SEG_BASE = [
+  { key: "wholesaler", label: "Wholesaler (Yesss / CEF)", ytd: 87, runRate: 20, product: "MX7", color: "#001C3D" },
+  { key: "distributor", label: "Distributor (Stearn / Argos / Kelvelec)", ytd: 77, runRate: 17, product: "MX7", color: "#00B1A1" },
+  { key: "dealer_base", label: "Dealer (BYD)", ytd: 31, runRate: 15, product: "MX7", color: "#3a6ea5" },
+  { key: "b2b_base", label: "Installer (ChargedEV)", ytd: 56, runRate: 8, product: "MX7", color: "#5fa8a0" },
+  { key: "ecom", label: "eCommerce", ytd: 18, runRate: 4, product: "MX7", color: "#9bb0c2" },
+];
+const PIPELINE_TYPES = ["Wholesaler", "Distributor", "Installer", "Dealer", "Fleet Manager", "Rental / Leasing", "MDU / Housing", "CPO", "Other B2B"];
+
+function SegmentSim() {
+  // --- load any previously saved snapshot (works on hosted site; ignored if storage blocked) ---
+  const loadSaved = () => {
+    try {
+      const raw = window.localStorage.getItem("huk_segment_sim");
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) { return null; }
+  };
+  const saved = loadSaved();
+
+  const [rr, setRr] = useState(() =>
+    (saved && saved.rr) ? saved.rr : Object.fromEntries(SEG_BASE.map((s) => [s.key, s.runRate]))
+  );
+  const [pipe, setPipe] = useState(() =>
+    (saved && saved.pipe) ? saved.pipe : [
+      { id: 1, name: "BYD (additional dealers)", type: "Dealer", monthly: 20, startMonth: 7, product: "MX7" },
+      { id: 2, name: "Fleet pilot", type: "Fleet Manager", monthly: 10, startMonth: 8, product: "MX7" },
+      { id: 3, name: "MDU project", type: "MDU / Housing", monthly: 15, startMonth: 9, product: "MX22" },
+    ]
+  );
+  const [nid, setNid] = useState(() => (saved && saved.nid) ? saved.nid : 4);
+  const [saveMsg, setSaveMsg] = useState("");
+
+  const saveSnapshot = () => {
+    try {
+      window.localStorage.setItem("huk_segment_sim", JSON.stringify({ rr, pipe, nid }));
+      setSaveMsg("Saved · " + new Date().toLocaleTimeString());
+    } catch (e) {
+      setSaveMsg("Could not save (storage blocked in preview — works on hosted site)");
+    }
+  };
+  const resetSnapshot = () => {
+    try { window.localStorage.removeItem("huk_segment_sim"); } catch (e) {}
+    setRr(Object.fromEntries(SEG_BASE.map((s) => [s.key, s.runRate])));
+    setPipe([
+      { id: 1, name: "BYD (additional dealers)", type: "Dealer", monthly: 20, startMonth: 7, product: "MX7" },
+      { id: 2, name: "Fleet pilot", type: "Fleet Manager", monthly: 10, startMonth: 8, product: "MX7" },
+      { id: 3, name: "MDU project", type: "MDU / Housing", monthly: 15, startMonth: 9, product: "MX22" },
+    ]);
+    setNid(4);
+    setSaveMsg("Reset to defaults");
+  };
+
+  const addPipe = () => {
+    setPipe((p) => [...p, { id: nid, name: "New customer", type: "Dealer", monthly: 10, startMonth: 7, product: "MX7" }]);
+    setNid(nid + 1);
+  };
+  const updPipe = (id, k, v) => setPipe((p) => p.map((x) => (x.id === id ? { ...x, [k]: v } : x)));
+  const delPipe = (id) => setPipe((p) => p.filter((x) => x.id !== id));
+
+  const calc = useMemo(() => {
+    const monthlyUnits = SEG_MONTHS.map(() => 0);
+    const monthlyRev = SEG_MONTHS.map(() => 0);
+    const segTotals = {};
+    SEG_BASE.forEach((s) => {
+      let u = 0;
+      for (let m = 0; m < 12; m++) {
+        const units = m < 6 ? s.ytd / 6 : rr[s.key];
+        u += units;
+        monthlyUnits[m] += units;
+        monthlyRev[m] += units * prodPrice(s.product);
+      }
+      segTotals[s.key] = {
+        label: s.label, units: u, rev: u * prodPrice(s.product), color: s.color,
+        mx7: s.product === "MX22" ? 0 : u, mx22: s.product === "MX22" ? u : 0,
+      };
+    });
+    const pipeTotals = pipe.map((c) => {
+      let u = 0;
+      for (let m = 0; m < 12; m++) {
+        if (m + 1 >= c.startMonth) {
+          u += c.monthly;
+          monthlyUnits[m] += c.monthly;
+          monthlyRev[m] += c.monthly * prodPrice(c.product);
+        }
+      }
+      return { ...c, units: u, rev: u * prodPrice(c.product), mx7: c.product === "MX22" ? 0 : u, mx22: c.product === "MX22" ? u : 0 };
+    });
+    const totUnits = monthlyUnits.reduce((a, b) => a + b, 0);
+    const totRev = monthlyRev.reduce((a, b) => a + b, 0);
+    const totMx7 = SEG_BASE.reduce((a, s) => a + segTotals[s.key].mx7, 0) + pipeTotals.reduce((a, c) => a + c.mx7, 0);
+    const totMx22 = SEG_BASE.reduce((a, s) => a + segTotals[s.key].mx22, 0) + pipeTotals.reduce((a, c) => a + c.mx22, 0);
+    return { monthlyUnits, monthlyRev, segTotals, pipeTotals, totUnits, totRev, totMx7, totMx22 };
+  }, [rr, pipe]);
+
+  const maxMonthly = Math.max(...calc.monthlyUnits, 1);
+  const fmtGBP0 = (n) => "£" + Math.round(n).toLocaleString();
+  const baseTotal = SEG_BASE.reduce((a, s) => a + calc.segTotals[s.key].units, 0);
+  const pipeTotal = calc.pipeTotals.reduce((a, c) => a + c.units, 0);
+
+  return (
+    <div>
+      <div style={SG.actionBar}>
+        <div style={SG.actionInfo}>
+          <span style={SG.actionTitle}>Segment Simulation · 2026</span>
+          <span style={SG.actionMsg}>{saveMsg || "Save to keep your inputs when switching tabs or reloading"}</span>
+        </div>
+        <div style={SG.actionBtns}>
+          <button style={SG.saveBtn} onClick={saveSnapshot}>Save</button>
+          <button style={SG.resetBtn} onClick={resetSnapshot}>Reset</button>
+        </div>
+      </div>
+      <div style={{ ...D.kpiRow, gridTemplateColumns: "repeat(4, 1fr)" }}>
+        <div style={D.kpi}>
+          <div style={D.kpiLabel}>2026 Total Units</div>
+          <div style={{ ...D.kpiVal, color: HX.indigo }}>{Math.round(calc.totUnits).toLocaleString()}</div>
+          <div style={D.kpiSub}>Existing {Math.round(baseTotal).toLocaleString()} + Pipeline {Math.round(pipeTotal).toLocaleString()}</div>
+          <div style={D.kpiBarWrap}>
+            <div style={{ ...D.kpiBar, width: `${Math.min((calc.totUnits / DASH.ev.bpQty) * 100, 100)}%`, background: HX.indigo }} />
+            <span style={D.kpiAch}>{((calc.totUnits / DASH.ev.bpQty) * 100).toFixed(1)}% of EV BP ({DASH.ev.bpQty.toLocaleString()})</span>
+          </div>
+        </div>
+        <div style={D.kpi}>
+          <div style={D.kpiLabel}>2026 Total Revenue</div>
+          <div style={{ ...D.kpiVal, color: HX.azure }}>{fmtGBP0(calc.totRev)}</div>
+          <div style={D.kpiSub}>{"₩" + Math.round(calc.totRev * getFX()).toLocaleString()}</div>
+          <div style={D.kpiBarWrap}>
+            <div style={{ ...D.kpiBar, width: `${Math.min((calc.totRev / DASH.ev.bpRev) * 100, 100)}%`, background: HX.azure }} />
+            <span style={D.kpiAch}>{((calc.totRev / DASH.ev.bpRev) * 100).toFixed(1)}% of EV BP ({fmtGBP0(DASH.ev.bpRev)})</span>
+          </div>
+        </div>
+        <div style={D.kpi}>
+          <div style={D.kpiLabel}>Pipeline Contribution</div>
+          <div style={{ ...D.kpiVal, color: HX.forest }}>{calc.totUnits ? ((pipeTotal / calc.totUnits) * 100).toFixed(0) : 0}%</div>
+          <div style={D.kpiSub}>{calc.pipeTotals.length} customers added</div>
+        </div>
+        <div style={D.kpi}>
+          <div style={D.kpiLabel}>Avg Monthly (H2)</div>
+          <div style={{ ...D.kpiVal, color: HX.indigo }}>{Math.round(calc.monthlyUnits.slice(6).reduce((a, b) => a + b, 0) / 6).toLocaleString()}</div>
+          <div style={D.kpiSub}>units / month (Jul–Dec)</div>
+        </div>
+      </div>
+
+      <section style={S.panel}>
+        <h2 style={S.h2}>2026 Monthly Volume (Existing + Pipeline)</h2>
+        <div style={D.chart}>
+          {SEG_MONTHS.map((m, i) => (
+            <div key={m} style={D.barCol}>
+              <div style={D.barStack}>
+                <div style={{ ...D.barActual, width: "60%", height: `${(calc.monthlyUnits[i] / maxMonthly) * 100}%`, background: i < 6 ? "#c4d0dc" : HX.azure }}
+                  title={`${Math.round(calc.monthlyUnits[i])} units`} />
+              </div>
+              <div style={D.barLabel}>{m}</div>
+              <div style={SG.barNum}>{Math.round(calc.monthlyUnits[i])}</div>
+            </div>
+          ))}
+        </div>
+        <div style={D.legend}>
+          <span><i style={{ ...D.dot, background: "#c4d0dc" }} /> Jan–Jun (actual run-rate)</span>
+          <span><i style={{ ...D.dot, background: HX.azure }} /> Jul–Dec (forecast)</span>
+        </div>
+      </section>
+
+      <div style={D.grid2}>
+        <section style={S.panel}>
+          <h2 style={S.h2}>Existing Channels — H2 Run-Rate</h2>
+          <div style={S.panelNote}>Jan–Jun uses actual YTD; sliders set Jul–Dec monthly units per channel.</div>
+          {SEG_BASE.map((s) => (
+            <div key={s.key} style={S.sliderRow}>
+              <div style={S.sliderHead}>
+                <span style={S.sliderName}><i style={{ ...D.dot, background: s.color }} />{s.label}</span>
+                <span style={S.sliderVal}>{Math.round(calc.segTotals[s.key].units).toLocaleString()} units · {fmtGBP0(calc.segTotals[s.key].rev)}</span>
+              </div>
+              <input type="range" min="0" max="80" value={rr[s.key]}
+                onChange={(e) => setRr((p) => ({ ...p, [s.key]: +e.target.value }))} style={S.range} />
+              <div style={S.sliderSub}>YTD {s.ytd} · H2 run-rate {rr[s.key]}/mo · {s.product}</div>
+            </div>
+          ))}
+        </section>
+
+        <section style={S.panel}>
+          <div style={SG.pipeHead}>
+            <h2 style={{ ...S.h2, margin: 0 }}>Pipeline Customers</h2>
+            <button onClick={addPipe} style={SG.addBtn}>+ Add</button>
+          </div>
+          <div style={S.panelNote}>Add Wholesaler / Distributor / Installer / Dealer / Fleet / Rental·Leasing / MDU / CPO and set monthly units, start month, product.</div>
+          {pipe.map((c) => (
+            <div key={c.id} style={SG.pipeCard}>
+              <div style={SG.pipeRow1}>
+                <input value={c.name} onChange={(e) => updPipe(c.id, "name", e.target.value)} style={SG.nameInput} />
+                <button onClick={() => delPipe(c.id)} style={SG.delBtn}>✕</button>
+              </div>
+              <div style={SG.pipeRow2}>
+                <select value={c.type} onChange={(e) => updPipe(c.id, "type", e.target.value)} style={SG.sel}>
+                  {PIPELINE_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
+                </select>
+                <select value={c.product} onChange={(e) => updPipe(c.id, "product", e.target.value)} style={SG.selSm}>
+                  <option value="MX7">MX7</option>
+                  <option value="MX22">MX22</option>
+                </select>
+              </div>
+              <div style={SG.pipeRow3}>
+                <label style={SG.miniLabel}>Units/mo
+                  <input type="number" min="0" value={c.monthly} onChange={(e) => updPipe(c.id, "monthly", +e.target.value)} style={SG.numInput} />
+                </label>
+                <label style={SG.miniLabel}>Start
+                  <select value={c.startMonth} onChange={(e) => updPipe(c.id, "startMonth", +e.target.value)} style={SG.selSm}>
+                    {SEG_MONTHS.map((m, i) => <option key={m} value={i + 1}>{m}</option>)}
+                  </select>
+                </label>
+                <span style={SG.pipeResult}>{(() => { const ct = calc.pipeTotals.find((x) => x.id === c.id); return ct ? `${ct.units.toLocaleString()} units · ${fmtGBP0(ct.rev)}` : ""; })()}</span>
+              </div>
+            </div>
+          ))}
+        </section>
+      </div>
+
+      <section style={S.panel}>
+        <h2 style={S.h2}>2026 Segment Summary</h2>
+        <div style={SG.tbl}>
+          <div style={{ ...SG.tr, ...SG.trHead }}>
+            <span>Segment</span><span style={SG.tRight}>MX7</span><span style={SG.tRight}>MX22</span><span style={SG.tRight}>Total</span><span style={SG.tRight}>Revenue (£)</span><span style={SG.tRight}>Share</span>
+          </div>
+          {SEG_BASE.map((s) => {
+            const t = calc.segTotals[s.key];
+            return (
+              <div key={s.key} style={SG.tr}>
+                <span><i style={{ ...D.dot, background: s.color }} />{t.label}</span>
+                <span style={SG.tRight}>{Math.round(t.mx7).toLocaleString()}</span>
+                <span style={SG.tRight}>{Math.round(t.mx22).toLocaleString()}</span>
+                <span style={SG.tRight}>{Math.round(t.units).toLocaleString()}</span>
+                <span style={SG.tRight}>{fmtGBP0(t.rev)}</span>
+                <span style={SG.tRight}>{((t.units / calc.totUnits) * 100).toFixed(0)}%</span>
+              </div>
+            );
+          })}
+          {calc.pipeTotals.map((c) => (
+            <div key={c.id} style={SG.tr}>
+              <span><i style={{ ...D.dot, background: HX.sunshine }} />{c.name} <em style={SG.typeTag}>{c.type}</em></span>
+              <span style={SG.tRight}>{c.mx7.toLocaleString()}</span>
+              <span style={SG.tRight}>{c.mx22.toLocaleString()}</span>
+              <span style={SG.tRight}>{c.units.toLocaleString()}</span>
+              <span style={SG.tRight}>{fmtGBP0(c.rev)}</span>
+              <span style={SG.tRight}>{calc.totUnits ? ((c.units / calc.totUnits) * 100).toFixed(0) : 0}%</span>
+            </div>
+          ))}
+          <div style={{ ...SG.tr, ...SG.trTotal }}>
+            <span>Total</span>
+            <span style={SG.tRight}>{Math.round(calc.totMx7).toLocaleString()}</span>
+            <span style={SG.tRight}>{Math.round(calc.totMx22).toLocaleString()}</span>
+            <span style={SG.tRight}>{Math.round(calc.totUnits).toLocaleString()}</span>
+            <span style={SG.tRight}>{fmtGBP0(calc.totRev)}</span>
+            <span style={SG.tRight}>100%</span>
+          </div>
+        </div>
+        <div style={S.footNote}>
+          2026 only. MX7 blended £{prodPrice("MX7").toFixed(0)}/unit · MX22 £{prodPrice("MX22").toFixed(0)}/unit · FX {getFX()} KRW/£.
+          Existing channels: Jan–Jun actual + adjustable H2 run-rate. Pipeline: monthly units from start month to Dec.
+        </div>
+      </section>
+    </div>
+  );
+}
+
+// ============================================================
+//  SETTINGS — central pricing / margin / FX (referenced by all pages)
+// ============================================================
+function Settings({ onChange }) {
+  const [, force] = useState(0);
+  const set = (path, v) => {
+    const num = v === "" ? 0 : +v;
+    const [grp, key] = path.split(".");
+    CONFIG[grp][key] = num;
+    force((x) => x + 1);
+    onChange && onChange();
+  };
+
+  const priceRows = [
+    ["MX7 Socket", "price.ev_socket"],
+    ["MX7 5M", "price.ev_5m"],
+    ["MX7 7.5M", "price.ev_75m"],
+    ["MX Pro 22kW (MX22)", "price.ev_22kw"],
+    ["STB FHR-6000T", "price.stb_fhr"],
+  ];
+  const mixRows = [
+    ["Socket weight", "mix.socket"],
+    ["5M weight", "mix.c5m"],
+    ["7.5M weight", "mix.c75m"],
+  ];
+  const gmRows = [
+    ["EV", "gm.ev"],
+    ["STB", "gm.stb"],
+    ["BT", "gm.bt"],
+  ];
+  const mixSum = CONFIG.mix.socket + CONFIG.mix.c5m + CONFIG.mix.c75m;
+
+  const Field = ({ label, path, step, suffix, prefix }) => {
+    const [grp, key] = path.split(".");
+    return (
+      <div style={ST.field}>
+        <label style={ST.fieldLabel}>{label}</label>
+        <div style={ST.inputWrap}>
+          {prefix && <span style={ST.affix}>{prefix}</span>}
+          <input type="number" step={step || "0.01"} value={CONFIG[grp][key]}
+            onChange={(e) => set(path, e.target.value)} style={ST.input} />
+          {suffix && <span style={ST.affix}>{suffix}</span>}
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div>
+      <div style={ST.banner}>
+        These values are the single source of truth. Editing them updates the Dashboard, Segment Simulation, and 3-Year Simulator instantly.
+      </div>
+
+      <div style={D.grid2}>
+        <section style={S.panel}>
+          <h2 style={S.h2}>Model Prices (GBP)</h2>
+          <div style={S.panelNote}>Per-unit selling price by model.</div>
+          {priceRows.map(([l, p]) => <Field key={p} label={l} path={p} prefix="£" step="0.01" />)}
+          <div style={{ ...S.catTotal, marginTop: 16 }}>
+            <span style={S.catTotalLabel}>EV Home Blended</span>
+            <span style={S.catTotalVal}>£{evBlended().toFixed(2)}/unit</span>
+          </div>
+        </section>
+
+        <section style={S.panel}>
+          <h2 style={S.h2}>Margin Rate & FX</h2>
+          <div style={S.panelNote}>Gross margin by line and KRW/GBP exchange rate.</div>
+          <div style={S.blockLabel}>Gross Margin (%)</div>
+          {gmRows.map(([l, p]) => {
+            const [grp, key] = p.split(".");
+            return (
+              <div key={p} style={ST.field}>
+                <label style={ST.fieldLabel}>{l}</label>
+                <div style={ST.inputWrap}>
+                  <input type="number" step="1" value={+(CONFIG[grp][key] * 100).toFixed(1)}
+                    onChange={(e) => { CONFIG[grp][key] = (e.target.value === "" ? 0 : +e.target.value) / 100; force((x) => x + 1); onChange && onChange(); }}
+                    style={ST.input} />
+                  <span style={ST.affix}>%</span>
+                </div>
+              </div>
+            );
+          })}
+          <div style={{ ...S.blockLabel, marginTop: 16 }}>Exchange Rate</div>
+          <div style={ST.field}>
+            <label style={ST.fieldLabel}>KRW per GBP</label>
+            <div style={ST.inputWrap}>
+              <span style={ST.affix}>₩</span>
+              <input type="number" step="0.001" value={CONFIG.fx}
+                onChange={(e) => { CONFIG.fx = e.target.value === "" ? 0 : +e.target.value; force((x) => x + 1); onChange && onChange(); }}
+                style={ST.input} />
+            </div>
+          </div>
+
+          <div style={{ ...S.blockLabel, marginTop: 16 }}>EV Home Mix Weights</div>
+          <div style={S.panelNote}>How MX7 sales split across variants (used for the blended EV price). Sum: {(mixSum * 100).toFixed(0)}%{Math.abs(mixSum - 1) > 0.001 ? " ⚠ should be 100%" : " ✓"}</div>
+          {mixRows.map(([l, p]) => <Field key={p} label={l} path={p} step="0.05" suffix="" />)}
+        </section>
+      </div>
+
+      <section style={S.panel}>
+        <div style={DL.panelHead}>
+          <div style={DL.connInfo}>
+            <span style={DL.connDot(LIVE.data || LIVE.poRecs)} />
+            <h2 style={{ ...S.h2, margin: 0 }}>Google Sheet Live Link</h2>
+          </div>
+          <div style={DL.btns}>
+            <button style={DL.connBtn} onClick={() => loadLiveData(() => { force((x) => x + 1); onChange && onChange(); })}>Connect</button>
+            <button style={DL.connBtnGhost} onClick={() => loadLiveData(() => { force((x) => x + 1); onChange && onChange(); })} title="Refresh">↻</button>
+          </div>
+        </div>
+        <div style={S.panelNote}>{LIVE.status || "Paste each tab's published CSV link (…/pub?gid=…&output=csv), then Connect. Data appears on the Sales Dashboard."}</div>
+        <div style={DL.inputGrid}>
+          <label style={DL.inLabel}>Monthly Tracking
+            <input style={DL.connInput} placeholder="…/pub?gid=…&output=csv (KPIs & charts)"
+              defaultValue={LIVE.urls.monthly} onChange={(e) => { LIVE.urls.monthly = e.target.value; }} />
+          </label>
+          <label style={DL.inLabel}>KPI — Channel Achievement
+            <input style={DL.connInput} placeholder="…/pub?gid=…&output=csv (Retail / B2B / eCommerce)"
+              defaultValue={LIVE.urls.kpi} onChange={(e) => { LIVE.urls.kpi = e.target.value; }} />
+          </label>
+          <label style={DL.inLabel}>Simon — Order Master
+            <input style={DL.connInput} placeholder="…/pub?gid=…&output=csv (PO detail)"
+              defaultValue={LIVE.urls.simon} onChange={(e) => { LIVE.urls.simon = e.target.value; }} />
+          </label>
+          <label style={DL.inLabel}>Mudassar — Order Master
+            <input style={DL.connInput} placeholder="…/pub?gid=…&output=csv (PO detail)"
+              defaultValue={LIVE.urls.mudassar} onChange={(e) => { LIVE.urls.mudassar = e.target.value; }} />
+          </label>
+          <label style={DL.inLabel}>B2B — Order Master
+            <input style={DL.connInput} placeholder="…/pub?gid=…&output=csv (PO detail)"
+              defaultValue={LIVE.urls.b2b} onChange={(e) => { LIVE.urls.b2b = e.target.value; }} />
+          </label>
+        </div>
+        <div style={DL.hint}>Monthly Tracking drives the Dashboard KPIs &amp; charts; the KPI link feeds the Channel Achievement bars (Retail = Simon + Mudassar, split EV Home / Commercial); the three Order Master tabs feed the Sales by Channel table &amp; Product Mix. Leave any blank to skip. File must be a Google Sheet (not .xlsx), each tab Published to web as CSV.</div>
+      </section>
+
+      <section style={S.panel}>
+        <h2 style={S.h2}>Current Effective Values</h2>
+        <div style={ST.summaryGrid}>
+          <div style={ST.sumCard}><div style={ST.sumLabel}>EV Blended</div><div style={ST.sumVal}>£{evBlended().toFixed(2)}</div></div>
+          <div style={ST.sumCard}><div style={ST.sumLabel}>MX22 / Commercial</div><div style={ST.sumVal}>£{PRICE.ev_22kw.toFixed(0)}</div></div>
+          <div style={ST.sumCard}><div style={ST.sumLabel}>STB</div><div style={ST.sumVal}>£{PRICE.stb_fhr.toFixed(0)}</div></div>
+          <div style={ST.sumCard}><div style={ST.sumLabel}>EV / STB / BT GM</div><div style={ST.sumVal}>{(GM.ev*100).toFixed(0)}/{(GM.stb*100).toFixed(0)}/{(GM.bt*100).toFixed(0)}%</div></div>
+          <div style={ST.sumCard}><div style={ST.sumLabel}>FX</div><div style={ST.sumVal}>₩{getFX().toLocaleString()}</div></div>
+        </div>
+        <div style={S.footNote}>
+          Changes apply immediately across all tabs for this session. Reload restores defaults (MX7 Socket £332.14 / 5M £342.37 / 7.5M £357.73 · MX22 £579 · STB £153 · GM 20/20/100% · FX 1810.195).
+        </div>
+      </section>
+    </div>
+  );
+}
+
+
+function HUKApp() {
+  const [tab, setTab] = useState("dashboard");
+  const [, setBump] = useState(0);
+  const onConfigChange = () => setBump((b) => b + 1);
+  return (
+    <div style={S.page}>
+      <style>{CSS}</style>
+      <div style={D.appHeader}>
+        <div>
+          <div style={D.appKicker}>HUMAX UK · EV CHARGING</div>
+          <h1 style={D.appTitle}>Revenue & Scenario Console</h1>
+        </div>
+        <div style={D.tabGroup}>
+          <button onClick={() => setTab("dashboard")}
+            style={{ ...D.tab, ...(tab === "dashboard" ? D.tabActive : {}) }}>
+            Sales Dashboard
+          </button>
+          <button onClick={() => setTab("segment")}
+            style={{ ...D.tab, ...(tab === "segment" ? D.tabActive : {}) }}>
+            Segment Simulation
+          </button>
+          <button onClick={() => setTab("simulator")}
+            style={{ ...D.tab, ...(tab === "simulator" ? D.tabActive : {}) }}>
+            3-Year Simulator
+          </button>
+          <button onClick={() => setTab("settings")}
+            style={{ ...D.tab, ...(tab === "settings" ? D.tabActive : {}) }}>
+            ⚙ Settings
+          </button>
+        </div>
+      </div>
+      {tab === "dashboard" ? <Dashboard /> : tab === "segment" ? <SegmentSim /> : tab === "simulator" ? <Simulator embedded /> : <Settings onChange={onConfigChange} />}
+    </div>
+  );
+}
+
+const D = {
+  appHeader: { display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 16, background: HX.indigo, borderRadius: 16, padding: "20px 28px", marginBottom: 22, boxShadow: "0 8px 28px rgba(0,28,61,.18)" },
+  appKicker: { fontSize: 11, letterSpacing: 3, color: HX.azure, fontWeight: 600, textTransform: "uppercase" },
+  appTitle: { fontFamily: "'Poppins', sans-serif", fontSize: 26, fontWeight: 700, color: "#fff", margin: "4px 0 0", letterSpacing: -0.3 },
+  tabGroup: { display: "flex", gap: 4, background: "rgba(255,255,255,.1)", padding: 4, borderRadius: 12 },
+  tab: { fontFamily: "'Poppins', sans-serif", fontSize: 13.5, fontWeight: 600, padding: "9px 20px", border: "none", borderRadius: 8, background: "transparent", color: "#aebccd", cursor: "pointer" },
+  tabActive: { background: HX.azure, color: HX.indigo },
+  kpiRow: { display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 14, marginBottom: 20 },
+  kpi: { background: HX.card, border: `1px solid ${HX.line}`, borderRadius: 16, padding: "18px 20px", boxShadow: "0 4px 18px rgba(0,28,61,.05)" },
+  kpiLabel: { fontSize: 11.5, color: HX.muted, fontWeight: 500, textTransform: "uppercase", letterSpacing: 0.5 },
+  kpiVal: { fontFamily: "'Poppins', sans-serif", fontSize: 27, fontWeight: 700, lineHeight: 1.2, margin: "6px 0 2px" },
+  kpiSub: { fontSize: 11.5, color: "#8a98a8", fontWeight: 300 },
+  kpiBarWrap: { marginTop: 10, position: "relative", height: 16, background: "#eef2f6", borderRadius: 8, overflow: "hidden" },
+  kpiBar: { position: "absolute", left: 0, top: 0, bottom: 0, borderRadius: 8 },
+  kpiAch: { position: "absolute", right: 8, top: 1, fontSize: 10, fontWeight: 600, color: HX.indigo, lineHeight: "15px" },
+  grid2: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20, marginBottom: 20 },
+  chart: { display: "flex", alignItems: "flex-end", gap: 8, height: 200, padding: "10px 0", borderBottom: `1px solid ${HX.line}` },
+  barCol: { flex: 1, display: "flex", flexDirection: "column", alignItems: "center", height: "100%", justifyContent: "flex-end" },
+  barStack: { position: "relative", width: "100%", height: "100%", display: "flex", alignItems: "flex-end", justifyContent: "center" },
+  barTarget: { position: "absolute", bottom: 0, width: "70%", background: "#c4d0dc", borderRadius: "3px 3px 0 0" },
+  barActual: { position: "relative", width: "44%", background: HX.azure, borderRadius: "3px 3px 0 0", zIndex: 1 },
+  barLabel: { fontSize: 10, color: HX.muted, marginTop: 5 },
+  legend: { display: "flex", gap: 18, marginTop: 12, fontSize: 11.5, color: HX.muted },
+  dot: { display: "inline-block", width: 10, height: 10, borderRadius: 3, marginRight: 5, verticalAlign: "middle" },
+  mixRow: { display: "grid", gridTemplateColumns: "1.1fr 2fr 0.9fr", alignItems: "center", gap: 10, marginBottom: 11 },
+  mixLabel: { fontSize: 12.5, fontWeight: 500 },
+  mixTrack: { height: 14, background: "#eef2f6", borderRadius: 7, overflow: "hidden" },
+  mixFill: { height: "100%", borderRadius: 7 },
+  mixVal: { fontSize: 11.5, color: HX.muted, textAlign: "right", fontWeight: 500 },
+  catGrid: { marginTop: 6 },
+  catRow: { display: "grid", gridTemplateColumns: "1.3fr 2.2fr 1.1fr", alignItems: "center", gap: 12, marginBottom: 12 },
+  catLabel: { fontSize: 12.5, fontWeight: 500 },
+  catTrack: { position: "relative", height: 18, background: "#f3f6f9", borderRadius: 6 },
+  catTargetMark: { position: "absolute", left: 0, top: 0, bottom: 0, background: "#e3e9ef", borderRadius: 6 },
+  catActualBar: { position: "absolute", left: 0, top: 0, bottom: 0, background: HX.azure, borderRadius: 6, minWidth: 3 },
+  catVal: { fontSize: 11.5, color: HX.muted, textAlign: "right", fontWeight: 500 },
+  stockRow: { display: "grid", gridTemplateColumns: "repeat(6, 1fr)", gap: 12, marginTop: 6 },
+  stockCard: { background: "#f7fafb", border: `1px solid ${HX.line}`, borderRadius: 12, padding: "16px 12px", textAlign: "center" },
+  stockQty: { fontFamily: "'Poppins', sans-serif", fontSize: 24, fontWeight: 700, color: HX.indigo },
+  stockLabel: { fontSize: 11, color: HX.muted, marginTop: 4 },
+};
+
+const SG = {
+  barNum: { fontSize: 9.5, color: HX.muted, marginTop: 2, fontWeight: 500 },
+  pipeHead: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 2 },
+  addBtn: { fontFamily: "'Poppins', sans-serif", fontSize: 12.5, fontWeight: 600, padding: "6px 14px", border: "none", borderRadius: 8, background: HX.azure, color: HX.indigo, cursor: "pointer" },
+  actionBar: { display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12, background: "#fff", border: `1px solid ${HX.line}`, borderRadius: 14, padding: "12px 18px", marginBottom: 18, boxShadow: "0 2px 12px rgba(0,28,61,.04)" },
+  actionInfo: { display: "flex", flexDirection: "column", gap: 2 },
+  actionTitle: { fontFamily: "'Poppins', sans-serif", fontSize: 13, fontWeight: 600, color: HX.indigo },
+  actionMsg: { fontSize: 11.5, color: HX.muted, fontWeight: 300 },
+  actionBtns: { display: "flex", gap: 8 },
+  saveBtn: { fontFamily: "'Poppins', sans-serif", fontSize: 12.5, fontWeight: 600, padding: "8px 20px", border: "none", borderRadius: 8, background: HX.azure, color: HX.indigo, cursor: "pointer" },
+  resetBtn: { fontFamily: "'Poppins', sans-serif", fontSize: 12.5, fontWeight: 600, padding: "8px 16px", border: `1px solid ${HX.line}`, borderRadius: 8, background: "#fff", color: HX.muted, cursor: "pointer" },
+  pipeCard: { background: "#f7fafb", border: `1px solid ${HX.line}`, borderRadius: 12, padding: "12px 14px", marginBottom: 10 },
+  pipeRow1: { display: "flex", gap: 8, marginBottom: 8 },
+  nameInput: { flex: 1, fontFamily: "'Poppins', sans-serif", fontSize: 13, fontWeight: 600, color: HX.indigo, border: `1px solid ${HX.line}`, borderRadius: 7, padding: "6px 10px", background: "#fff" },
+  delBtn: { border: "none", background: "#fdecec", color: "#d64545", borderRadius: 7, width: 30, cursor: "pointer", fontWeight: 700 },
+  pipeRow2: { display: "flex", gap: 8, marginBottom: 8 },
+  sel: { flex: 1, fontFamily: "'Poppins', sans-serif", fontSize: 12.5, border: `1px solid ${HX.line}`, borderRadius: 7, padding: "6px 8px", background: "#fff", color: HX.ink },
+  selSm: { fontFamily: "'Poppins', sans-serif", fontSize: 12.5, border: `1px solid ${HX.line}`, borderRadius: 7, padding: "6px 8px", background: "#fff", color: HX.ink },
+  pipeRow3: { display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" },
+  miniLabel: { fontSize: 11, color: HX.muted, display: "flex", alignItems: "center", gap: 5, fontWeight: 500 },
+  numInput: { width: 58, fontFamily: "'Poppins', sans-serif", fontSize: 12.5, border: `1px solid ${HX.line}`, borderRadius: 7, padding: "5px 8px", background: "#fff", color: HX.ink },
+  pipeResult: { marginLeft: "auto", fontFamily: "'Poppins', sans-serif", fontSize: 12.5, fontWeight: 600, color: HX.indigo },
+  tbl: { marginTop: 4 },
+  tr: { display: "grid", gridTemplateColumns: "2.2fr 0.8fr 0.8fr 0.8fr 1.2fr 0.7fr", padding: "8px 6px", borderBottom: `1px solid ${HX.line}`, fontSize: 13, alignItems: "center" },
+  trHead: { fontFamily: "'Poppins', sans-serif", fontSize: 11, letterSpacing: 0.5, color: HX.muted, fontWeight: 600, textTransform: "uppercase", borderBottom: `2px solid ${HX.line}` },
+  trTotal: { fontFamily: "'Poppins', sans-serif", fontWeight: 700, color: HX.indigo, borderTop: `2px solid ${HX.indigo}`, borderBottom: "none", background: "#f7fafb" },
+  tRight: { textAlign: "right", fontFamily: "'Poppins', sans-serif" },
+  typeTag: { fontStyle: "normal", fontSize: 10.5, color: HX.muted, background: "#eef2f6", padding: "1px 7px", borderRadius: 5, marginLeft: 6 },
+};
+
+const ST = {
+  banner: { background: `linear-gradient(135deg, ${HX.indigo}, ${HX.forest})`, color: "#fff", borderRadius: 14, padding: "16px 22px", marginBottom: 20, fontSize: 13.5, fontWeight: 400, lineHeight: 1.5 },
+  field: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 11, gap: 12 },
+  fieldLabel: { fontSize: 13.5, fontWeight: 500, color: HX.ink },
+  inputWrap: { display: "flex", alignItems: "center", gap: 6, background: "#fff", border: `1px solid ${HX.line}`, borderRadius: 8, padding: "2px 10px" },
+  affix: { fontSize: 12.5, color: HX.muted, fontWeight: 500 },
+  input: { width: 90, fontFamily: "'Poppins', sans-serif", fontSize: 13.5, fontWeight: 600, color: HX.indigo, border: "none", outline: "none", textAlign: "right", padding: "6px 2px", background: "transparent" },
+  summaryGrid: { display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 12, marginTop: 4 },
+  sumCard: { background: "#f7fafb", border: `1px solid ${HX.line}`, borderRadius: 12, padding: "14px 12px", textAlign: "center" },
+  sumLabel: { fontSize: 10.5, color: HX.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 5 },
+  sumVal: { fontFamily: "'Poppins', sans-serif", fontSize: 18, fontWeight: 700, color: HX.indigo },
+};
+
+const DL = {
+  statusBar: { display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12, background: "#fff", border: `1px solid ${HX.line}`, borderRadius: 14, padding: "12px 18px", marginBottom: 18, boxShadow: "0 2px 12px rgba(0,28,61,.04)" },
+  panel: { background: "#fff", border: `1px solid ${HX.line}`, borderRadius: 14, padding: "14px 18px", marginBottom: 18, boxShadow: "0 2px 12px rgba(0,28,61,.04)" },
+  panelHead: { display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12, marginBottom: 12 },
+  btns: { display: "flex", gap: 8 },
+  inputGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 },
+  inLabel: { display: "flex", flexDirection: "column", gap: 4, fontSize: 11, fontWeight: 600, color: HX.muted },
+  hint: { fontSize: 11, color: HX.muted, marginTop: 10, lineHeight: 1.5 },
+  connInfo: { display: "flex", alignItems: "center", gap: 10 },
+  connDot: (live) => ({ width: 9, height: 9, borderRadius: "50%", background: live ? HX.azure : "#c4d0dc", display: "inline-block", boxShadow: live ? `0 0 0 3px rgba(0,177,161,.2)` : "none" }),
+  connTitle: { fontFamily: "'Poppins', sans-serif", fontSize: 12.5, fontWeight: 600, color: HX.indigo },
+  connStatus: { fontSize: 11.5, color: HX.muted, fontWeight: 300 },
+  connInput: { flex: 1, fontFamily: "'Poppins', sans-serif", fontSize: 12, border: `1px solid ${HX.line}`, borderRadius: 8, padding: "8px 12px", background: "#f7fafb", color: HX.ink, fontWeight: 400 },
+  connBtn: { fontFamily: "'Poppins', sans-serif", fontSize: 12.5, fontWeight: 600, padding: "8px 16px", border: "none", borderRadius: 8, background: HX.azure, color: HX.indigo, cursor: "pointer", whiteSpace: "nowrap" },
+  connBtnGhost: { fontFamily: "'Poppins', sans-serif", fontSize: 14, fontWeight: 600, padding: "8px 12px", border: `1px solid ${HX.line}`, borderRadius: 8, background: "#fff", color: HX.indigo, cursor: "pointer" },
+};
+
+const SIMLINK = {
+  bar: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, background: "#f7fafb", border: `1px solid ${HX.line}`, borderRadius: 10, padding: "10px 14px", marginBottom: 12 },
+  title: { fontFamily: "'Poppins', sans-serif", fontSize: 12.5, fontWeight: 600, color: HX.indigo },
+  sub: { fontSize: 11, color: HX.muted, marginTop: 2, lineHeight: 1.4 },
+  toggle: { fontFamily: "'Poppins', sans-serif", fontSize: 12, fontWeight: 600, padding: "7px 16px", border: `1px solid ${HX.azure}`, borderRadius: 8, background: "#fff", color: HX.indigo, cursor: "pointer", whiteSpace: "nowrap" },
+  toggleOn: { background: HX.azure, color: HX.indigo, border: `1px solid ${HX.azure}` },
+  toggleDisabled: { opacity: 0.4, cursor: "not-allowed", borderColor: HX.line },
+};
+
+const PO = {
+  head: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 12, marginBottom: 10 },
+  toggle: { display: "flex", gap: 4, background: "#eef2f6", borderRadius: 8, padding: 3 },
+  tBtn: { fontFamily: "'Poppins', sans-serif", fontSize: 12, fontWeight: 600, padding: "6px 14px", border: "none", borderRadius: 6, background: "transparent", color: HX.muted, cursor: "pointer" },
+  tBtnOn: { background: "#fff", color: HX.indigo, boxShadow: "0 1px 4px rgba(0,28,61,.12)" },
+  scroll: { overflowX: "auto", border: `1px solid ${HX.line}`, borderRadius: 10 },
+  grid: (n) => ({ display: "grid", gridTemplateColumns: `minmax(120px,1.4fr) minmax(110px,1.2fr) repeat(${n}, minmax(40px,1fr)) minmax(56px,0.8fr) minmax(90px,1.1fr)`, alignItems: "center", minWidth: 680 }),
+  headRow: { background: HX.indigo, color: "#fff", fontFamily: "'Poppins', sans-serif", fontSize: 11, fontWeight: 600, letterSpacing: 0.3 },
+  bRow: { background: "#fff", fontSize: 12, color: HX.ink, borderTop: `1px solid #eef2f6` },
+  groupTop: { borderTop: `2px solid ${HX.line}` },
+  subRow: { background: "#f7fafb", fontFamily: "'Poppins', sans-serif", fontSize: 11.5, fontWeight: 600, color: HX.azure, borderTop: `1px solid ${HX.line}` },
+  totRow: { background: HX.forest, color: "#fff", fontFamily: "'Poppins', sans-serif", fontWeight: 700, fontSize: 12.5, borderTop: `2px solid ${HX.indigo}` },
+  caret: { display: "inline-block", width: 14, color: HX.azure },
+  cWhole: { padding: "9px 10px", whiteSpace: "nowrap", fontFamily: "'Poppins', sans-serif", fontWeight: 600, color: HX.indigo },
+  cBranch: { padding: "9px 10px", whiteSpace: "nowrap", fontFamily: "'Poppins', sans-serif", fontWeight: 400, color: HX.ink },
+  cNum: { padding: "9px 6px", textAlign: "center", fontFamily: "'Poppins', sans-serif", fontSize: 11.5 },
+  cTot: { padding: "9px 8px", textAlign: "right", fontFamily: "'Poppins', sans-serif", fontWeight: 600 },
+  cRev: { padding: "9px 12px", textAlign: "right", fontFamily: "'Poppins', sans-serif" },
+};
+
+
+ReactDOM.createRoot(document.getElementById('root')).render(<HUKApp />);
+</script>
+</body>
+</html>
